@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insecure-web-app
+  labels:
+    app: vulnerable-demo
+    security: disabled
+spec:
+  containers:
+  - name: web-server
+    image: nginx:1.14.0
+    ports:
+    - containerPort: 80
+    env:
+    - name: DATABASE_PASSWORD
+      value: "superSecretPassword123!"
+    - name: API_KEY
+      value: "sk-1234567890abcdefghijklmnopqrstuvwxyz"
+    - name: AWS_ACCESS_KEY_ID
+      value: "AKIAIOSFODNN7EXAMPLE"
+    - name: AWS_SECRET_ACCESS_KEY
+      value: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    - name: JWT_SECRET
+      value: "my-insecure-jwt-secret-key"
+    - name: ADMIN_USERNAME
+      value: "admin"
+    - name: ADMIN_PASSWORD
+      value: "admin123"
+    securityContext:
+      allowPrivilegeEscalation: true
+      privileged: true
+      runAsNonRoot: false
+      runAsUser: 0
+      capabilities:
+        add:
+        - SYS_ADMIN
+        - NET_ADMIN
+        - ALL
+    volumeMounts:
+    - name: host-root
+      mountPath: /host
+  volumes:
+  - name: host-root
+    hostPath:
+      path: /
+      type: Directory
+  hostPID: true
+  hostIPC: true
