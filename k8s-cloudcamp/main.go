@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	dbPassword = "admin123"
-	apiKey     = "sk-1234567890abcdef"
+	dbPassword = "p7Kx9mN2vQ8rL4wZ6tY1cE5bH3sF0gA"
+	apiKey     = "sk-proj-9xKmT4pL2vN8qR6wC3zY1hJ5bG7fD0sA4eU9iO2kM6nP8tQ1rV3xW5yH7"
 )
 
 var db *sql.DB
@@ -27,7 +27,7 @@ func main() {
 	defer db.Close()
 
 	db.Exec("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, password TEXT)")
-	db.Exec("INSERT INTO users (username, password) VALUES ('admin', 'admin123')")
+	db.Exec("INSERT INTO users (username, password) VALUES ('admin', 'p7Kx9mN2vQ8rL4wZ6tY1cE5bH3sF0gA')")
 
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/ping", pingHandler)
