@@ -36,14 +36,6 @@ spec:
         - SYS_ADMIN
         - NET_ADMIN
         - ALL
-    volumeMounts:
-    - name: host-root
-      mountPath: /host
-  volumes:
-  - name: host-root
-    hostPath:
-      path: /
-      type: Directory
   hostNetwork: true
   hostPID: true
   hostIPC: true
