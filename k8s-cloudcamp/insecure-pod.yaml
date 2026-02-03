@@ -2,6 +2,9 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: insecure-web-app
+  namespace: default
+  annotations:
+    container.apparmor.security.beta.kubernetes.io/web-server: runtime/default
   labels:
     app: vulnerable-demo
     security: disabled
@@ -9,6 +12,7 @@ spec:
   containers:
   - name: web-server
     image: igoreulalio/cloudcamp-k8s-vulnerableapp:v5
+    imagePullPolicy: Always
     ports:
     - containerPort: 8080
     env:
@@ -28,15 +32,32 @@ spec:
       value: "h4Bf9Np2Mv6Qw8Ky3Jx7Lz1Gc5Fa0"
     - name: OPENAI_API_KEY
       value: "sk-proj-8mLq5Tp2Nv9Kr4Wx7Cy1Jz6Hb3Gs0Fa5Du8Eo2Im4Mp7Oq9Rw1Tx3Vy6"
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    livenessProbe:
+      httpGet:
+        path: /
+        port: 8080
+      initialDelaySeconds: 30
+      periodSeconds: 10
+    readinessProbe:
+      httpGet:
+        path: /
+        port: 8080
+      initialDelaySeconds: 5
+      periodSeconds: 5
     securityContext:
-      allowPrivilegeEscalation: true
-      privileged: true
-      runAsNonRoot: false
-      runAsUser: 0
+      allowPrivilegeEscalation: false
+      privileged: false
+      runAsNonRoot: true
+      runAsUser: 1000
       capabilities:
-        add:
-        - SYS_ADMIN
-        - NET_ADMIN
+        drop:
         - ALL
     volumeMounts:
     - name: host-root
@@ -46,6 +67,7 @@ spec:
     hostPath:
       path: /
       type: Directory
-  hostNetwork: true
-  hostPID: true
-  hostIPC: true
+  ```yaml
+    hostNetwork: false
+    hostPID: false
+    hostIPC: false
