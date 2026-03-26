@@ -4,8 +4,7 @@ description: Fetch an Orca alert by ID and apply a code fix to resolve the vulne
 argument-hint: "<alert-id>"
 disable-model-invocation: true
 context: fork
-agent: Explore
-allowed-tools: Read, Edit, Write, mcp__orca-remote__get_alert
+allowed-tools: Read, Edit, Write, mcp__orca__get_alert
 ---
 
 # Orca Fix Alert Skill
@@ -19,12 +18,11 @@ Fetch an Orca alert and fix the vulnerability in the repository code.
 
 ## Workflow
 
+The alert ID to fix is: **$ARGUMENTS**
+
 ### Step 1: Fetch the alert
 
-Call `mcp__orca-remote__get_alert` with:
-```
-alert_id = $ARGUMENTS   (e.g. "orca-270453")
-```
+Call `mcp__orca__get_alert(alert_id="$ARGUMENTS")`.
 
 From the response (`data[0].data`), extract these fields:
 
