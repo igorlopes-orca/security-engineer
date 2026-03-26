@@ -4,7 +4,7 @@ description: Fetch an Orca alert by ID and apply a code fix to resolve the vulne
 argument-hint: "<alert-id>"
 disable-model-invocation: true
 context: fork
-allowed-tools: Read, Edit, Write, mcp__orca__get_alert
+allowed-tools: Read, Edit, Write, mcp__orca-remote__get_alert
 ---
 
 # Orca Fix Alert Skill
@@ -22,7 +22,7 @@ The alert ID to fix is: **$ARGUMENTS**
 
 ### Step 1: Fetch the alert
 
-Call `mcp__orca__get_alert(alert_id="$ARGUMENTS")`.
+Call `mcp__orca-remote__get_alert(alert_id="$ARGUMENTS")`.
 
 From the response (`data[0].data`), extract these fields:
 
