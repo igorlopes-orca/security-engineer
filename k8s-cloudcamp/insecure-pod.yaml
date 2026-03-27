@@ -21,7 +21,10 @@ spec:
     - name: API_KEY
       value: "sk-proj-9xKmT4pL2vN8qR6wC3zY1hJ5bG7fD0sA4eU9iO2kM6nP8tQ1rV3xW5yH7"
     - name: AWS_ACCESS_KEY_ID
-      value: "AKIAZQXNB8H4M7JTPR2K"
+      valueFrom:
+        secretKeyRef:
+          name: aws-credentials
+          key: aws_access_key_id
     - name: AWS_SECRET_ACCESS_KEY
       value: "8vC2nX5mK9pL4wQ7rY1tZ3bH6sJ0fA2eU8iO5kM9nP4qR7tV2xW6yH3z"
     - name: JWT_SECRET
