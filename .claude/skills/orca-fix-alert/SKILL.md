@@ -3,7 +3,6 @@ name: orca-fix-alert
 description: Fetch an Orca alert by ID and apply a code fix to resolve the vulnerability
 argument-hint: "<alert-id>"
 disable-model-invocation: true
-context: fork
 allowed-tools: Read, Edit, Write, Bash
 ---
 

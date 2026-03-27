@@ -85,15 +85,14 @@ func userHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "SELECT username, password FROM users WHERE username = '" + username + "'"
-	rows, err := db.Query(query)
+	rows, err := db.Query("SELECT username, password FROM users WHERE username = ?", username)
 	if err != nil {
 		fmt.Fprintf(w, "Database error: %v\n", err)
 		return
 	}
 	defer rows.Close()
 
-	fmt.Fprintf(w, "Query: %s\n\n", query)
+	fmt.Fprintf(w, "Query results:\n\n")
 	for rows.Next() {
 		var user, pass string
 		rows.Scan(&user, &pass)
