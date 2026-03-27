@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -64,13 +65,14 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func fileHandler(w http.ResponseWriter, r *http.Request) {
-	filepath := r.URL.Query().Get("path")
-	if filepath == "" {
+	userInput := r.URL.Query().Get("path")
+	if userInput == "" {
 		fmt.Fprintf(w, "Usage: /file?path=<filepath>\n")
 		return
 	}
 
-	content, err := os.ReadFile(filepath)
+	safeFile := filepath.Base(userInput)
+	content, err := os.ReadFile(safeFile)
 	if err != nil {
 		fmt.Fprintf(w, "Error reading file: %v\n", err)
 		return
