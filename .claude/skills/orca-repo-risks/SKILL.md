@@ -3,7 +3,6 @@ name: orca-repo-risks
 description: Identify all Orca security risks for a GitHub repository
 argument-hint: "[owner/repo] [--level high] [--types sast,iac]"
 disable-model-invocation: true
-context: fork
 allowed-tools: Bash
 ---
 
