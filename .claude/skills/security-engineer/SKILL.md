@@ -2,7 +2,6 @@
 name: security-engineer
 description: Autonomous security agent — filters Orca alerts and dispatches specialist fix agents in parallel
 argument-hint: "[risk_levels,feature_types] [--alert <id>] [--max N] [--dry-run] [owner/repo]"
-context: fork
 allowed-tools: Bash, Agent
 ---
 
