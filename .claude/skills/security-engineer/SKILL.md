@@ -1,197 +1,94 @@
 ---
 name: security-engineer
-description: Autonomous security agent — filters Orca alerts and dispatches specialist fix agents in parallel
+description: Autonomous security agent — Python orchestrator fixes Orca alerts with validation, impact analysis, and notifications
 argument-hint: "[risk_levels,feature_types] [--alert <id>] [--max N] [--dry-run] [owner/repo]"
-context: fork
-allowed-tools: Bash, Agent
+allowed-tools: Bash
 ---
 
 # Security Engineer Agent
 
-Autonomous security remediation loop. Fetches Orca alerts, dispatches parallel specialist subagents per alert, collects results, and reports a summary.
-
-In **live mode**: agents fix code and open PRs.
-In **dry-run mode**: agents read files and describe the planned fix — but have no write tools available, so they cannot modify anything even if they try.
-
-## Usage
-
+```bash
+python3 .claude/skills/security-engineer/orchestrator.py $ARGUMENTS
 ```
-/security-engineer                    → all open fixable alerts
-/security-engineer high               → high and above, all types
-/security-engineer critical,sast      → critical severity, sast type only
-/security-engineer high,sast,iac      → high+, sast and iac types only
-/security-engineer --dry-run high     → plan only — agents read files but cannot edit
-/security-engineer --alert orca-270453        → fix one specific alert
-/security-engineer --alert orca-270453 --dry-run  → plan fix for one alert
-/security-engineer --max 3 high       → cap at 3 fixes
-/security-engineer high igorlopes-orca/se-lab  → explicit repo
-```
+
+Return the output verbatim.
 
 ---
 
-## Workflow
+## Usage Reference
 
-### Step 1: Parse arguments
-
-Arguments: **$ARGUMENTS**
-
-Scan $ARGUMENTS for:
-- **`--dry-run`** — present or absent
-- **`--alert <id>`** — specific alert ID (e.g. `orca-270453`); bypasses bulk fetch when present
-- **`--max N`** — integer N, or absent
-- **filter tokens** — comma-separated risk levels / feature types (e.g. `high,sast,cve`)
-- **repo** — explicit `owner/repo` if present; otherwise detect with `git remote get-url origin`
-
-Set `DRY_RUN = true` if `--dry-run` appears anywhere in $ARGUMENTS.
-
-If `DRY_RUN == true`, announce at the start:
 ```
-Mode: DRY-RUN — agents will read files and plan fixes, but cannot edit or create PRs.
+/security-engineer                             → all fixable alerts, all severities
+/security-engineer cve                         → CVE alerts only, all severities
+/security-engineer high                        → high+ severity, all types
+/security-engineer high,cve                    → high+ severity AND CVE type only
+/security-engineer critical,sast               → critical+ AND SAST only
+/security-engineer --dry-run cve               → plan CVE fixes — read-only, no git ops
+/security-engineer --dry-run high,sast         → plan high+ SAST fixes — no edits
+/security-engineer --alert orca-270453         → fix one specific alert (live)
+/security-engineer --alert orca-270453 --dry-run → plan one specific alert
+/security-engineer --max 3 cve                 → cap at 3 CVE fixes
+/security-engineer cve owner/repo              → target explicit repo
 ```
 
-### Step 2: Fetch and categorize alerts
+## Filter Rules
 
-Run:
-```bash
-python3 .claude/skills/security-engineer/run_agent.py list-alerts [repo] \
-  [--alert <id>] [--filter <tokens>] [--max <N>] --fixable-only
+**Risk levels** (cumulative — specifying `high` includes `critical` too):
+- `critical` → critical only
+- `high` → critical + high
+- `medium` → critical + high + medium
+- `low` → everything except informational
+
+**Feature types** (exact match — only alerts of those types):
+- `cve` → package/dependency CVEs (category "Vulnerabilities")
+- `sast` → source code vulnerabilities
+- `iac` → Dockerfiles, K8s YAML, Terraform
+- `secret` → hardcoded credentials
+
+Combine with comma: `high,cve` = high+ severity AND CVE type. Both conditions must match.
+
+## --dry-run Guarantees
+
+Three independent enforcement layers:
+1. **Tool restriction** — claude subprocess receives `--allowedTools Read` only; Edit/Write/Bash are physically unavailable
+2. **Orchestrator gate** — returns immediately after fix plan; validation, commit, and PR steps are never reached
+3. **Commit guard** — `_commit_and_pr()` also checks dry_run as defense in depth
+
+Run `python3 .claude/skills/security-engineer/tests/test_orchestrator.py` to verify all flags are enforced correctly.
+
+## Pipeline (Live Mode)
+
+```
+For each alert (parallel, isolated git worktree per alert):
+
+  1. create_worktree        → /tmp/orca-fix-<id>  (isolated branch)
+  2. invoke_fix_agent       → claude subprocess, --allowedTools Read,Edit,Write,Bash
+                              timeout: sast=180s, iac/secret=120s, cve=240s
+                              retries: up to 2 on json_parse / subprocess errors
+  3. validate (Phase 1)     → Python: diff non-empty, diff size, no new secrets
+  4. validate (Phase 2)     → LLM: does the fix address the vulnerability?
+  5. validate (Phase 3)     → Local build: go build / py_compile / npm build
+  6. impact_agent           → claude subprocess: analyze diff → production risk JSON
+  7. git-commit             → run_agent.py git-commit
+  8. open-pr                → run_agent.py open-pr (includes impact in PR body)
+  9. validate (Phase 4)     → CI gate: gh pr checks --watch (timeout: 10min)
+ 10. notify                 → console + log file + GitHub PR comment
+ 11. remove_worktree        → cleanup /tmp/orca-fix-<id> + local branch
 ```
 
-When `--alert` is provided, pass it directly and omit `--filter` and `--max` — the script fetches only that alert by ID.
+## Notifications
 
-The output is a JSON object: `{"dry_run": bool, "alerts": [...]}`.
+Always active:
+- Console output (`[OK]`, `[FAIL]`, `[TOUT]`, etc.)
+- `security-engineer-run.json` — newline-delimited JSON log of all events
 
-From `alerts`, bucket each item:
-- **to_fix**: `is_fixable == true` AND `branch_exists == false`
-- **skipped**: `is_fixable == true` AND `branch_exists == true`
-- **scm_posture**: `feature_type == "scm_posture"`
-- **unfixable**: other non-fixable types
+Opt-in:
+- `NOTIFY_WEBHOOK_URL=https://...` → HTTP POST on every event (Slack, Teams, etc.)
+- GitHub PR comment with impact assessment (posted automatically after PR is opened)
 
-Print the plan table:
-```
-Repository: owner/repo
-Filter: <tokens or "all">
+## Environment Variables
 
-Found N alerts:
-  ✓ X to fix
-  ⟳ Y skipped (branch exists)
-  ℹ Z scm_posture (manual action)
-  ✗ W other unfixable
-
-Planned fixes:
-  1. orca-270453 — SQL Injection (high, sast) — k8s-cloudcamp/main.go:88
-  2. orca-270452 — Dockerfile root user (low, iac) — k8s-cloudcamp/Dockerfile
-```
-
-If `to_fix` is empty, skip to Step 5.
-
-### Step 3: Fetch full alert details
-
-For each alert in `to_fix`, run:
-```bash
-python3 .claude/skills/security-engineer/run_agent.py get-alert <alert_id>
-```
-
-Collect the full alert JSON. This is passed to the fix agents.
-
-### Step 4: Dispatch fix agents IN PARALLEL
-
-Read the specialist instruction file for each alert type:
-- `sast` → `.claude/skills/fix-agents/sast.md`
-- `iac` → `.claude/skills/fix-agents/iac.md`
-- `secret` → `.claude/skills/fix-agents/secret.md`
-- `cve` → `.claude/skills/fix-agents/cve.md`
-
-**Spawn all fix agents simultaneously** — one Agent tool call per alert, all in the same message.
-
-**Tools to grant each agent:**
-- Live mode (`DRY_RUN == false`): `Read, Edit, Write, Bash`
-- Dry-run mode (`DRY_RUN == true`): `Read` only
-
-**Agent prompt structure:**
-
-For **live mode**:
-```
-You are fixing a security vulnerability. Alert details:
-
-<full alert JSON>
-
-Instructions:
-
-<full contents of fix-agents/<type>.md>
-```
-
-For **dry-run mode**:
-```
-DRY RUN — you may only read files, not edit them.
-
-You are planning a fix for a security vulnerability. Alert details:
-
-<full alert JSON>
-
-Instructions (for reference — do NOT execute any steps that write files or run git/PR commands):
-
-<full contents of fix-agents/<type>.md>
-
-Your task:
-1. Read the source file at the path in "source" (strip the line number).
-2. Identify the exact lines that need to change.
-3. Show the before/after diff of what the fix would look like.
-4. Explain why this fixes the vulnerability.
-5. List any manual follow-up steps.
-6. Return your response as a structured plan — NOT a PR URL.
-```
-
-### Step 5: Collect results and print summary
-
-**Live mode** — each agent returns a PR URL or failure reason:
-
-```markdown
-## Security Engineer — Run Summary
-
-**Repo:** owner/repo  |  **Mode:** Live
-
-### Fixed — PRs Opened (N)
-| Alert ID | Title | Risk | Type | PR |
-|---|---|---|---|---|
-| orca-270453 | SQL Injection | high | sast | https://... |
-
-### Skipped — Branch Already Exists (N)
-| Alert ID | Branch |
-|---|---|
-
-### Fix Failed (N)
-| Alert ID | Reason |
-|---|---|
-
-### SCM Posture — Manual Action Required (N)
-| Alert ID | Title | Risk | Action |
-|---|---|---|---|
-```
-
-**Dry-run mode** — each agent returns a structured plan:
-
-```markdown
-## Security Engineer — Dry-run Plan
-
-**Repo:** owner/repo  |  **Mode:** DRY-RUN (no files were modified)
-
-### Planned Fixes (N)
-For each alert, show the agent's planned fix:
-
-#### orca-270453 — SQL Injection (high, sast)
-**File:** k8s-cloudcamp/main.go  |  **Lines:** 88–89
-**Before:**
-  query := "SELECT ... WHERE username = '" + username + "'"
-**After:**
-  rows, err := db.Query("SELECT ... WHERE username = ?", username)
-**Why:** Eliminates string concatenation that allows SQL injection.
-
-...
-
-### SCM Posture — Manual Action Required (N)
-| Alert ID | Title | Risk | Action |
-|---|---|---|---|
-```
-
-If more alerts remain past `--max`: `N more fixable alerts exist. Re-run to process more.`
+| Variable | Required | Purpose |
+|---|---|---|
+| `ORCA_API_TOKEN` | Yes | Orca API token (base64 string from Orca config) |
+| `NOTIFY_WEBHOOK_URL` | No | Webhook for Slack/Teams notifications |
