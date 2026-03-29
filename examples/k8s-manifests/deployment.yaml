@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vulnerable-app
+  template:
+    metadata:
+      labels:
+        app: vulnerable-app
+    spec:
+      hostPID: true
+      hostNetwork: true
+      hostIPC: true
+      containers:
+        - name: app
+          image: myapp:latest
+          imagePullPolicy: Always
+          securityContext:
+            privileged: true
+            runAsUser: 0
+            allowPrivilegeEscalation: true
+            readOnlyRootFilesystem: false
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - NET_ADMIN
+                - ALL
+          env:
+            - name: ADMIN_PASSWORD
+              value: "admin123"
+            - name: DB_PASSWORD
+              value: "prod-db-pass-123"
+            - name: SECRET_KEY
+              value: "hardcoded-jwt-secret"
+          ports:
+            - containerPort: 3000
+          # No resource limits — can consume unlimited CPU/memory
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
