@@ -24,7 +24,7 @@ Identify all Orca security risks for a GitHub repository via the Orca API.
 Pass all arguments directly to the script — it handles repo detection automatically:
 
 ```bash
-python3 .claude/skills/orca-repo-risks/orca_alerts.py $ARGUMENTS
+python3 ${CLAUDE_SKILL_DIR}/orca_alerts.py $ARGUMENTS
 ```
 
 The script reads `ORCA_API_TOKEN` or `ORCA_AUTH_TOKEN` from the environment.
@@ -35,4 +35,4 @@ Return the script output as-is. It is a formatted markdown report with alert cou
 
 If the script exits with an error (missing token, HTTP error), report the message to the user.
 
-Suggest `/orca-fix-alert <alert-id>` for individual fixes or `/security-engineer` for automated bulk fixes.
+Suggest `/security-engineer:orca-fix-alert <alert-id>` for individual fixes or `/security-engineer:security-engineer` for automated bulk fixes.

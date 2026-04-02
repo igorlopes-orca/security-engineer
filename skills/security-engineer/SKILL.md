@@ -8,7 +8,7 @@ allowed-tools: Bash
 # Security Engineer Agent
 
 ```bash
-python3 .claude/skills/security-engineer/orchestrator.py $ARGUMENTS
+python3 ${CLAUDE_SKILL_DIR}/orchestrator.py $ARGUMENTS
 ```
 
 Return the output verbatim. If the script exits with a non-zero exit code, print the error and STOP — do not retry, do not correct arguments, do not attempt to fix the command on the user's behalf.
@@ -63,7 +63,7 @@ Three independent enforcement layers:
 2. **Orchestrator gate** — returns immediately after fix plan; validation, commit, and PR steps are never reached
 3. **Commit guard** — `_commit_and_pr()` also checks dry_run as defense in depth
 
-Run `python3 .claude/skills/security-engineer/tests/test_orchestrator.py` to verify all flags are enforced correctly.
+Run `python3 ${CLAUDE_SKILL_DIR}/tests/test_orchestrator.py` to verify all flags are enforced correctly.
 
 ## Pipeline (Live Mode)
 

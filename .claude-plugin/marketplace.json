@@ -1,0 +1,17 @@
+{
+  "name": "orca-security",
+  "owner": {
+    "name": "Orca Security"
+  },
+  "metadata": {
+    "description": "Orca Security plugins for Claude Code"
+  },
+  "plugins": [
+    {
+      "name": "security-engineer",
+      "source": ".",
+      "description": "Autonomous security agent that remediates Orca alerts with validation, impact analysis, and notifications",
+      "version": "1.0.0"
+    }
+  ]
+}

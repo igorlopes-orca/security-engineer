@@ -2,4 +2,4 @@
 
 Every new function or behaviour must have unit tests. Use table-driven tests: define a `CASES` list of `(description, input, expected)` tuples and loop with `self.subTest(description)`.
 
-Run: `python3 .claude/skills/security-engineer/tests/test_orchestrator.py`
+Run: `python3 skills/security-engineer/tests/test_orchestrator.py`

@@ -1,5 +1,0 @@
-*.yaml
-*.md
-.git
-.gitignore
-users.db
