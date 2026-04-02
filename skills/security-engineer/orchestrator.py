@@ -6,7 +6,7 @@ Replaces the LLM coordinator. Fetches Orca alerts, dispatches Claude fix agents
 as subprocesses with timeouts, validates fixes, assesses production impact,
 opens PRs, polls CI, and notifies.
 
-Usage: python3 orchestrator.py [filter_tokens] [--dry-run] [--alert ID] [--max N] [owner/repo]
+Usage: python3 orchestrator.py [filter_tokens] [--scan] [--dry-run] [--alert ID] [--max N] [--remote REPO]
 """
 import argparse
 import copy
@@ -25,7 +25,9 @@ _SKILLS_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
-from orca_client import RISK_ORDER, alert_branch_name, Repository, list_repositories, get_token
+from orca_client import (RISK_ORDER, alert_branch_name, Repository,
+                         list_repositories, get_token, fetch_alerts,
+                         _resolve_feature_type)
 
 from _json_util import find_last_json_with_key
 from notifier import build_notifiers, NotificationPayload
@@ -242,7 +244,7 @@ def _build_prompt_context(alert: dict) -> dict:
 
 
 def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int) -> FixAgentResult:
-    instructions_path = _SKILLS_DIR / "fix-agents" / f"{task.feature_type}.md"
+    instructions_path = _THIS_DIR / "fix-agents" / f"{task.feature_type}.md"
     if not instructions_path.exists():
         return FixAgentResult(
             success=False,
@@ -662,6 +664,116 @@ def _fetch_and_plan(args, repo: Repository) -> tuple[list[AlertTask], list[dict]
 
 
 # ---------------------------------------------------------------------------
+# Flag validation
+# ---------------------------------------------------------------------------
+
+def _validate_flags(args):
+    """Reject invalid flag combinations. Called immediately after argparse."""
+    if not args.scan:
+        return
+    if args.dry_run:
+        sys.exit("Error: --scan and --dry-run cannot be combined. "
+                 "--scan already lists alerts without fixing.")
+    if args.alert:
+        sys.exit("Error: --scan and --alert cannot be combined. "
+                 "To fix a single alert, drop --scan.")
+    if args.max:
+        sys.exit("Error: --scan and --max cannot be combined. "
+                 "--scan lists all matching alerts.")
+
+
+# ---------------------------------------------------------------------------
+# Scan mode
+# ---------------------------------------------------------------------------
+
+_RISK_BADGE = {"critical": "\U0001f534", "high": "\U0001f7e0",
+               "medium": "\U0001f7e1", "low": "\U0001f535",
+               "informational": "\u26aa"}
+
+
+def _print_scan_report(repo_name, alerts):
+    """Print a risk report grouped by severity — no fixes, no git ops."""
+    grouped = {lvl: [] for lvl in RISK_ORDER}
+    for a in alerts:
+        lvl = a["risk_level"] if a["risk_level"] in grouped else "informational"
+        grouped[lvl].append(a)
+
+    total = sum(len(v) for v in grouped.values())
+    print(f"# Orca Alerts — {repo_name}")
+    print(f"\nTotal open/in-progress: **{total}**\n")
+
+    print("| Risk Level | Count |")
+    print("|---|---|")
+    for lvl in RISK_ORDER:
+        n = len(grouped[lvl])
+        if n:
+            print(f"| {_RISK_BADGE.get(lvl, '')} {lvl.capitalize()} | {n} |")
+
+    for lvl in RISK_ORDER:
+        items = grouped[lvl]
+        if not items:
+            continue
+        print(f"\n## {_RISK_BADGE.get(lvl, '')} {lvl.capitalize()} ({len(items)})\n")
+        print("| Alert ID | Title | Category | Score | Type |")
+        print("|---|---|---|---|---|")
+        for a in items:
+            ftype = _resolve_feature_type(a)
+            print(f"| {a['alert_id']} | {a['title']} | {a['category']} | {a['score']} | {ftype} |")
+
+
+def _run_scan(args):
+    """Execute scan mode: fetch alerts and print risk report, then exit."""
+    from run_agent import parse_filter, min_level_from_list
+
+    levels, types = parse_filter(args.filter_tokens) if args.filter_tokens else (None, None)
+    min_level = min_level_from_list(levels)
+    token = get_token()
+
+    if args.remote is not None:
+        if args.remote == "all":
+            repos = list_repositories(token)
+            if not repos:
+                sys.exit("No repositories found in Orca.")
+            for repo in repos:
+                try:
+                    alerts = fetch_alerts(repo.name, token,
+                                          min_level=min_level, feature_types=types)
+                except RuntimeError as e:
+                    print(f"\nError fetching alerts for {repo.name}: {e}",
+                          file=sys.stderr)
+                    continue
+                if alerts:
+                    _print_scan_report(repo.name, alerts)
+                    print()
+        elif "/" in args.remote:
+            try:
+                alerts = fetch_alerts(args.remote, token,
+                                      min_level=min_level, feature_types=types)
+            except RuntimeError as e:
+                sys.exit(f"Error fetching alerts for {args.remote}: {e}")
+            if not alerts:
+                print(f"No alerts found for {args.remote}.")
+                return
+            _print_scan_report(args.remote, alerts)
+        else:
+            sys.exit("Error: --remote requires 'all' or 'owner/repo'")
+    else:
+        repo = _detect_repo()
+        if not repo:
+            sys.exit("Error: could not detect repo from git remote. "
+                     "Run from inside a git repo or use --scan --remote owner/repo.")
+        try:
+            alerts = fetch_alerts(repo.name, token,
+                                  min_level=min_level, feature_types=types)
+        except RuntimeError as e:
+            sys.exit(f"Error fetching alerts: {e}")
+        if not alerts:
+            print(f"No alerts found for {repo.name}.")
+            return
+        _print_scan_report(repo.name, alerts)
+
+
+# ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
@@ -872,6 +984,8 @@ def run_all_repos(args) -> None:
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Security Engineer Orchestrator")
+    parser.add_argument("--scan", action="store_true",
+                        help="List alerts without fixing (risk report)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan only — fix agents read files but cannot edit")
     parser.add_argument("--remote", default=None, metavar="REPO",
@@ -889,6 +1003,13 @@ def main(argv=None):
     args.filter_tokens = None
     for p in args.positional:
         args.filter_tokens = p
+
+    _validate_flags(args)
+
+    # --scan: risk report only, no fixes
+    if args.scan:
+        _run_scan(args)
+        return
 
     # --remote: clone-based pipeline (single repo or all Orca repos)
     if args.remote is not None:

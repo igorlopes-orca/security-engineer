@@ -53,17 +53,22 @@ export NOTIFY_WEBHOOK_URL="https://hooks.slack.com/..."
 
 ## Usage
 
-After installing, skills are namespaced under `security-engineer:`:
+After installing, the skill is namespaced under `security-engineer:`:
 
 ```
-/security-engineer:security-engineer                        → all fixable alerts
-/security-engineer:security-engineer high,cve               → high+ CVEs only
-/security-engineer:security-engineer --alert orca-270453    → single alert
-/security-engineer:security-engineer --dry-run cve          → plan only, no git ops
-/security-engineer:security-engineer --remote owner/repo    → clone and fix a remote repo
-/security-engineer:security-engineer --remote all           → fix all Orca-discovered repos
-/security-engineer:orca-repo-risks                          → list all risks for repo
-/security-engineer:orca-fix-alert orca-270453               → fix a single alert interactively
+# Fix mode — remediate alerts
+/security-engineer:run                              → all fixable alerts
+/security-engineer:run high,cve                     → high+ CVEs only
+/security-engineer:run --alert orca-270453          → fix a single alert
+/security-engineer:run --dry-run cve                → plan only, no git ops
+/security-engineer:run --remote owner/repo          → clone and fix a remote repo
+/security-engineer:run --remote all                 → fix all Orca-discovered repos
+
+# Scan mode — list risks without fixing
+/security-engineer:run --scan                       → list all risks for current repo
+/security-engineer:run --scan high                  → list high+ risks only
+/security-engineer:run --scan --remote owner/repo   → list risks for a remote repo
+/security-engineer:run --scan --remote all          → list risks across all repos
 ```
 
 ## Language coverage
@@ -86,10 +91,8 @@ If the build tool isn't installed the check is skipped (not failed) — CI in Ph
 .claude-plugin/plugin.json   → plugin manifest
 skills/
   security-engineer/         → orchestrator, validator, agents, notifier
-  fix-agents/                → fix instructions per vulnerability type (cve, sast, iac, secret)
+    fix-agents/              → fix instructions per vulnerability type (cve, sast, iac, secret)
   lib/                       → shared Orca API client
-  orca-fix-alert/            → single-alert fix skill
-  orca-repo-risks/           → repo risk summary skill
 docs/                        → design plans
 examples/                    → usage examples
 ```

@@ -15,6 +15,6 @@ claude plugin install security-engineer@orca-security
 
 echo ""
 echo "Done! Restart Claude Code or run /reload-plugins, then use:"
-echo "  /security-engineer:security-engineer          — fix all alerts"
-echo "  /security-engineer:security-engineer --dry-run — plan only"
-echo "  /security-engineer:orca-repo-risks            — list risks"
+echo "  /security-engineer:run                — fix all alerts"
+echo "  /security-engineer:run --dry-run      — plan only"
+echo "  /security-engineer:run --scan         — list risks"
