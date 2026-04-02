@@ -24,7 +24,7 @@ The alert ID to fix is: **$ARGUMENTS**
 
 Run:
 ```bash
-python3 .claude/skills/orca-fix-alert/orca_get_alert.py $ARGUMENTS
+python3 ${CLAUDE_SKILL_DIR}/orca_get_alert.py $ARGUMENTS
 ```
 
 The script reads `ORCA_API_TOKEN` or `ORCA_AUTH_TOKEN` from the environment and prints the alert details.
