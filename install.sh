@@ -7,6 +7,11 @@ if ! command -v claude &> /dev/null; then
   exit 1
 fi
 
+if ! command -v gh &> /dev/null; then
+  echo "Error: GitHub CLI (gh) is required. Install from https://cli.github.com/" >&2
+  exit 1
+fi
+
 echo "Adding Orca Security marketplace..."
 claude plugin marketplace add igorlopes-orca/security-engineer
 
