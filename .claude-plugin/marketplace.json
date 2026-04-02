@@ -9,7 +9,7 @@
   "plugins": [
     {
       "name": "security-engineer",
-      "source": ".",
+      "source": "./",
       "description": "Autonomous security agent that remediates Orca alerts with validation, impact analysis, and notifications",
       "version": "1.0.0"
     }

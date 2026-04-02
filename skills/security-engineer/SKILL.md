@@ -112,12 +112,13 @@ For each alert (up to 4 in parallel, isolated git worktree per alert):
   3. validate (Phase 1)     -> Python: diff non-empty, diff size, no new secrets
   4. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
   5. validate (Phase 3)     -> Local build (see Language Coverage below)
-  6. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
-  7. git-commit             -> run_agent.py git-commit
-  8. open-pr                -> run_agent.py open-pr (includes impact in PR body)
-  9. validate (Phase 4)     -> CI gate: gh pr checks --watch (timeout: 10min)
- 10. notify                 -> console + log file + GitHub PR comment
- 11. remove_worktree        -> cleanup /tmp/orca-fix-<id> + local branch
+  6. validate (Phase 3b)    -> orca-cli before/after scan (see Orca CLI Validation below)
+  7. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
+  8. git-commit             -> run_agent.py git-commit
+  9. open-pr                -> run_agent.py open-pr (includes impact in PR body)
+ 10. validate (Phase 4)     -> CI gate: gh pr checks --watch (timeout: 10min)
+ 11. notify                 -> console + log file + GitHub PR comment
+ 12. remove_worktree        -> cleanup /tmp/orca-fix-<id> + local branch
 ```
 
 ### Remote mode (`--remote owner/repo` or `--remote all`)
@@ -139,6 +140,34 @@ Adds a repo-level wrapper around the per-alert pipeline above.
 
 Max concurrent Claude subprocesses: 3 repos x 4 alerts = 12
 ```
+
+## Orca CLI Validation
+
+Phase 3b runs a before/after `orca-cli` scan to verify the fix and detect regressions:
+
+1. **Stash** the fix (revert to pre-fix state)
+2. **Scan baseline** with the appropriate scanner
+3. **Pop** the fix (re-apply)
+4. **Scan again** with fix applied
+5. **Compare fingerprints**: findings that disappeared = fix verified; new findings = regression
+
+| Alert type | Scanner | Command |
+|---|---|---|
+| sast | SAST | `orca-cli sast scan --path <worktree>` |
+| iac | IaC | `orca-cli iac scan --path <worktree>` |
+| cve | SCA | `orca-cli sca scan --path <worktree>` |
+| secret | Secrets | `orca-cli secrets scan --path <worktree>` |
+
+**Pass conditions:**
+- No new findings introduced by the fix
+- If no findings disappeared, the PR is flagged `needs-review` (the scanner may not cover the exact alert)
+
+**Skip conditions** (validation passes, flagged for review):
+- `orca-cli` not installed
+- `ORCA_SECURITY_API_TOKEN` / `ORCA_API_TOKEN` not set
+- No diff to compare
+
+**Environment:** Uses `ORCA_SECURITY_API_TOKEN` or falls back to `ORCA_API_TOKEN`. Scans use `--skip-scan-log` to avoid polluting the Orca platform.
 
 ## Language Coverage
 

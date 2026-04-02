@@ -32,6 +32,7 @@ from orca_client import (RISK_ORDER, alert_branch_name, Repository,
 from _json_util import find_last_json_with_key
 from notifier import build_notifiers, NotificationPayload
 from validator import sanity_check, llm_validate, local_build_check, ci_gate
+from orca_cli_validator import orca_cli_validate
 from impact_agent import analyze_impact, ImpactResult
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
@@ -523,6 +524,22 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         _revert(task.worktree_path)
         _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
+
+    # Phase 3b: orca-cli validation (before/after scan)
+    task.state = "VALIDATE_ORCA_CLI"
+    orca_val = orca_cli_validate(
+        task.alert_json, task.worktree_path, task.feature_type)
+    if not orca_val.passed:
+        task.state = "FAILED"
+        task.failure_reason = "; ".join(orca_val.failures)
+        p = _notify_payload(task)
+        p.repo = repo.name
+        notifier.notify("validation_failed", p)
+        _revert(task.worktree_path)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
+        return task
+    if orca_val.needs_review:
+        task.needs_review = True
 
     # Impact analysis
     task.state = "IMPACT_ANALYSIS"

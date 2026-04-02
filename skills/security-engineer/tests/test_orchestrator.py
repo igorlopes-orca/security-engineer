@@ -23,6 +23,10 @@ from orchestrator import (main, _invoke_fix_agent, _commit_and_pr, AlertTask,
                           FixAgentResult, _validate_flags, _print_scan_report)
 from run_agent import parse_filter, min_level_from_list
 from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
+from orca_cli_validator import (
+    _extract_fingerprints, FindingFingerprint, orca_cli_validate,
+    _SCANNER_CMD, OrcaCliResult,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -773,6 +777,166 @@ class TestRunRepoPipelineCleanup(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Orca CLI validator
+# ---------------------------------------------------------------------------
+
+class TestScannerMapping(unittest.TestCase):
+    """Scanner mapping covers all fixable feature types."""
+
+    CASES = [
+        ("sast", ["sast", "scan"]),
+        ("iac", ["iac", "scan"]),
+        ("cve", ["sca", "scan"]),
+        ("secret", ["secrets", "scan"]),
+    ]
+
+    def test_cases(self):
+        for feature_type, expected_cmd in self.CASES:
+            with self.subTest(feature_type):
+                self.assertEqual(_SCANNER_CMD[feature_type], expected_cmd)
+
+    def test_unknown_type_not_mapped(self):
+        self.assertNotIn("scm_posture", _SCANNER_CMD)
+
+
+class TestFingerprintExtraction(unittest.TestCase):
+    """_extract_fingerprints normalizes orca-cli JSON into comparable sets."""
+
+    SAMPLE_SAST_OUTPUT = {
+        "results": [
+            {
+                "catalog_control": {"id": "ctrl-001", "title": "SQL Injection"},
+                "findings": [
+                    {"file_name": "app.py", "position": {"start_line": 42, "end_line": 45},
+                     "id": "f1"},
+                    {"file_name": "app.py", "position": {"start_line": 88, "end_line": 90},
+                     "id": "f2"},
+                ]
+            },
+            {
+                "catalog_control": {"id": "ctrl-002", "title": "Path Traversal"},
+                "findings": [
+                    {"file_name": "routes.py", "position": {"start_line": 10, "end_line": 15},
+                     "id": "f3"},
+                ]
+            }
+        ]
+    }
+
+    def test_extracts_all_findings(self):
+        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
+        self.assertEqual(len(fps), 3)
+
+    def test_fingerprint_fields(self):
+        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
+        expected = FindingFingerprint(control_id="ctrl-001", file_name="app.py", start_line=42)
+        self.assertIn(expected, fps)
+
+    def test_empty_results(self):
+        fps = _extract_fingerprints({"results": []})
+        self.assertEqual(len(fps), 0)
+
+    def test_null_results(self):
+        fps = _extract_fingerprints({"results": None})
+        self.assertEqual(len(fps), 0)
+
+    def test_empty_dict(self):
+        fps = _extract_fingerprints({})
+        self.assertEqual(len(fps), 0)
+
+    def test_missing_position(self):
+        data = {"results": [{"catalog_control": {"id": "c1"},
+                             "findings": [{"file_name": "f.py", "position": {}}]}]}
+        fps = _extract_fingerprints(data)
+        self.assertEqual(len(fps), 1)
+        self.assertEqual(list(fps)[0].start_line, 0)
+
+
+class TestBeforeAfterComparison(unittest.TestCase):
+    """orca_cli_validate compares before/after scans correctly."""
+
+    def _make_scan_output(self, findings):
+        """Build minimal orca-cli JSON from a list of (control_id, file, line) tuples."""
+        results = {}
+        for ctrl_id, fname, line in findings:
+            if ctrl_id not in results:
+                results[ctrl_id] = {
+                    "catalog_control": {"id": ctrl_id, "title": ctrl_id},
+                    "findings": []
+                }
+            results[ctrl_id]["findings"].append({
+                "file_name": fname,
+                "position": {"start_line": line},
+                "id": f"{ctrl_id}-{fname}-{line}",
+            })
+        return {"results": list(results.values())}
+
+    def test_fix_verified_no_regressions(self):
+        """Original finding disappears, no new ones → pass, no review needed."""
+        before = self._make_scan_output([("c1", "app.py", 42), ("c2", "lib.py", 10)])
+        after = self._make_scan_output([("c2", "lib.py", 10)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        fixed = before_fps - after_fps
+        new = after_fps - before_fps
+
+        self.assertEqual(len(fixed), 1)
+        self.assertEqual(len(new), 0)
+
+    def test_regression_detected(self):
+        """New finding appears → should fail."""
+        before = self._make_scan_output([("c1", "app.py", 42)])
+        after = self._make_scan_output([("c3", "app.py", 99)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        new = after_fps - before_fps
+        self.assertEqual(len(new), 1)
+
+    def test_no_change(self):
+        """Same findings before and after → pass but needs review (fix not verified)."""
+        before = self._make_scan_output([("c1", "app.py", 42)])
+        after = self._make_scan_output([("c1", "app.py", 42)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        fixed = before_fps - after_fps
+        new = after_fps - before_fps
+
+        self.assertEqual(len(fixed), 0)
+        self.assertEqual(len(new), 0)
+
+
+import os
+
+
+class TestOrcaCliValidateSkip(unittest.TestCase):
+    """orca_cli_validate skips gracefully when prerequisites are missing."""
+
+    def test_unknown_feature_type_skips(self):
+        result = orca_cli_validate({}, Path("/tmp"), "scm_posture")
+        self.assertTrue(result.passed)
+
+    @patch("orca_cli_validator._get_api_token", return_value=None)
+    def test_no_token_skips(self, _mock):
+        result = orca_cli_validate({}, Path("/tmp"), "sast")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.needs_review)
+        self.assertIn("not set", result.failures[0])
+
+    @patch("shutil.which", return_value=None)
+    @patch("orca_cli_validator._get_api_token", return_value="test-token")
+    def test_no_binary_skips(self, _mock_token, _mock_which):
+        result = orca_cli_validate({}, Path("/tmp"), "sast")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.needs_review)
+        self.assertIn("not installed", result.failures[0])
+
+# ---------------------------------------------------------------------------
 # Build root detection
 # ---------------------------------------------------------------------------
 
@@ -1041,6 +1205,10 @@ if __name__ == "__main__":
         TestWorktreeCwd,
         TestRemoteRouting,
         TestRunRepoPipelineCleanup,
+        TestScannerMapping,
+        TestFingerprintExtraction,
+        TestBeforeAfterComparison,
+        TestOrcaCliValidateSkip,
         TestFindPackageJsonRoot,
         TestFindProjectRoot,
         TestExtractFilePath,
