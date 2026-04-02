@@ -29,7 +29,14 @@ Orca alerts
 ### Install the plugin
 
 ```bash
-claude /plugin install github:igorlopes-orca/security-engineer
+curl -sL https://raw.githubusercontent.com/igorlopes-orca/security-engineer/main/install.sh | bash
+```
+
+Or manually:
+
+```bash
+claude plugin marketplace add igorlopes-orca/security-engineer
+claude plugin install security-engineer@orca-security
 ```
 
 ### Set your Orca API token
