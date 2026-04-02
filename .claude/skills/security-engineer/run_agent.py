@@ -102,6 +102,11 @@ def _alert_to_entry(a):
 
 
 def cmd_list_alerts(args):
+    # In multi-repo mode the orchestrator passes --repo-dir so that git
+    # operations (detect_repo, branch_exists_remote) run in the right clone.
+    if getattr(args, "repo_dir", None):
+        os.chdir(args.repo_dir)
+
     token = get_token()
 
     # Single-alert mode: bypass bulk fetch
@@ -240,6 +245,8 @@ def main():
     p_list.add_argument("--max", type=int, default=None, help="Max number of alerts to return")
     p_list.add_argument("--fixable-only", action="store_true", help="Only return fixable alerts")
     p_list.add_argument("--dry-run", action="store_true", help="Signal dry-run mode in output")
+    p_list.add_argument("--repo-dir", default=None,
+                        help="Working directory for git operations (multi-repo mode)")
 
     # get-alert
     p_get = sub.add_parser("get-alert", help="Fetch single alert as JSON")

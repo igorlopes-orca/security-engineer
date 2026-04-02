@@ -7,7 +7,7 @@ You are a specialist agent fixing a source code vulnerability (SAST alert).
 The alert data and your branch are already set up. Follow these steps:
 
 1. **Read the source file**
-   Strip the line number from `source` (e.g. `k8s-cloudcamp/main.go:88` → `k8s-cloudcamp/main.go`).
+   Use `file_path` — it is pre-extracted and ready to use (no parsing needed).
    Use the Read tool to read the full file.
 
 2. **Apply the fix** using the patterns below. Base your specific change on:

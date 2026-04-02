@@ -12,6 +12,23 @@ import re
 import subprocess
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+
+@dataclass
+class Repository:
+    """A code repository with Orca metadata and an optional local clone path.
+
+    clone_path = None  → single-repo mode: all git ops use cwd (existing behaviour)
+    clone_path = Path  → multi-repo mode: all git ops run inside the cloned directory
+    """
+    name: str                           # "owner/repo" (derived from URL)
+    url: str                            # "https://github.com/owner/repo" (for cloning)
+    clone_path: Optional[Path] = None   # set by _clone_repo() in multi-repo mode
+    orca_score: float = 0.0
+    risk_level: str = ""
 
 ORCA_API = "https://api.orcasecurity.io/api/serving-layer/query"
 RISK_ORDER = ["critical", "high", "medium", "low", "informational"]
@@ -65,11 +82,65 @@ def _post(payload, token):
         raise RuntimeError(f"HTTP {e.code}: {body}")
 
 
+def _extract_file_path(source: str) -> str:
+    """Extract a clean relative file path from the Orca Source field.
+
+    Handles three formats:
+    - GitHub blob URL: https://github.com/owner/repo/blob/<sha>/path/to/file.js
+    - Path with line suffix: path/to/file.js:40
+    - Plain path: path/to/file.js
+    """
+    if not source:
+        return ""
+    if "github.com" in source and "/blob/" in source:
+        parts = source.split("/blob/")
+        if len(parts) > 1:
+            # Drop the sha/branch component (first segment after /blob/)
+            path = "/".join(parts[1].split("/")[1:])
+            return path.split("#")[0].strip("/")  # strip GitHub line anchor (#L40)
+    return source.split(":")[0].strip()
+
+
+def _normalize_code_snippet(raw_snippet):
+    """Normalize code_snippet to a list of code lines.
+
+    Orca returns different formats depending on alert type:
+    - Secret/SAST: list of dicts [{"line": "code...", "position": 3}, ...]
+    - Other:       list of strings ["code line 1", "code line 2"]
+    """
+    if not raw_snippet:
+        return [], None, None
+    lines = []
+    first_line = None
+    last_line = None
+    for entry in raw_snippet:
+        if isinstance(entry, dict):
+            lines.append(entry.get("line", "").rstrip("\n"))
+            pos = entry.get("position")
+            if pos is not None:
+                if first_line is None or pos < first_line:
+                    first_line = pos
+                if last_line is None or pos > last_line:
+                    last_line = pos
+        else:
+            lines.append(str(entry))
+    return lines, first_line, last_line
+
+
 def _normalize_alert(item):
     """Convert a raw API item into a clean dict."""
     findings = val(item, "RiskFindings", {}) or {}
     position = findings.get("position", {}) or {}
     ai_triage = findings.get("ai_triage", {}) or {}
+    source = val(item, "Source", "") or ""
+
+    # Normalize code_snippet and extract line numbers from it
+    raw_snippet = findings.get("code_snippet", [])
+    snippet_lines, snippet_start, snippet_end = _normalize_code_snippet(raw_snippet)
+
+    # Position: prefer explicit position dict, fall back to code_snippet positions
+    start_line = position.get("start_line") or snippet_start
+    end_line = position.get("end_line") or snippet_end
 
     return {
         "alert_id":       val(item, "AlertId") or item.get("name", ""),
@@ -78,21 +149,27 @@ def _normalize_alert(item):
         "score":          val(item, "OrcaScore"),
         "category":       val(item, "Category", ""),
         "status":         val(item, "Status", ""),
-        "source":         val(item, "Source", ""),
+        "source":         source,
+        "file_path":      _extract_file_path(source),
         "labels":         val(item, "Labels", []) or [],
         "description":    val(item, "Description", ""),
         "recommendation": val(item, "Recommendation", ""),
         "feature_type":   findings.get("feature_type", ""),
-        "code_snippet":   findings.get("code_snippet", []),
+        "code_snippet":   snippet_lines,            # always list[str] now
         "position": {
-            "start_line": position.get("start_line"),
-            "end_line":   position.get("end_line"),
+            "start_line": start_line,
+            "end_line":   end_line,
         },
         "ai_triage": {
             "explanation": ai_triage.get("explanation", ""),
             "verdict":     ai_triage.get("verdict", ""),
             "confidence":  ai_triage.get("confidence"),
         },
+        # Rich context from RiskFindings (available for fix agents)
+        "origin_url":     findings.get("origin_url", ""),
+        "verification":   findings.get("active_verification_status", ""),
+        "first_commit":   findings.get("first_commit", {}),
+        "is_test_file":   findings.get("is_test_file", False),
     }
 
 
@@ -205,6 +282,67 @@ def fetch_alerts(repo, token, min_level=None, feature_types=None, statuses=None)
     return alerts
 
 
+def list_repositories(token: str) -> list:
+    """Fetch all code repositories that have open/in-progress alerts in Orca.
+
+    Returns a list of Repository objects ordered by OrcaScore descending.
+    """
+    payload = {
+        "query": {
+            "models": ["CodeRepository"],
+            "type": "object_set",
+            "with": {
+                "keys": ["Alerts"],
+                "models": ["Alert"],
+                "type": "object_set",
+                "operator": "has",
+                "with": {
+                    "key": "Status",
+                    "values": ["open", "in_progress"],
+                    "type": "str",
+                    "operator": "in"
+                }
+            }
+        },
+        "limit": 100,
+        "start_at_index": 0,
+        "order_by[]": ["-OrcaScore"],
+        "select": [
+            "CiSource", "Name", "OrcaScore", "RiskLevel", "group_unique_id",
+            "Exposure", "State", "Observations", "Tags",
+            "ShiftleftProject.Name", "CodeLanguages", "Url"
+        ],
+        "get_results_and_count": False,
+        "full_graph_fetch": {"enabled": True},
+        "debug_enable_bu_tags": True,
+        "max_tier": 2,
+    }
+    result = _post(payload, token)
+    repos = []
+    seen_urls: set = set()
+    for item in result.get("data", []):
+        url = (val(item, "Url", "") or "").strip()
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        # Derive owner/repo from the clone URL
+        name = None
+        for sep in ("github.com/", "github.com:"):
+            if sep in url:
+                name = url.split(sep)[-1].removesuffix(".git").strip("/")
+                break
+        if not name:
+            # Fall back to the Orca Name field
+            name = (val(item, "Name", "") or url)
+        repos.append(Repository(
+            name=name,
+            url=url,
+            orca_score=float(val(item, "OrcaScore") or 0),
+            risk_level=(val(item, "RiskLevel", "") or "").lower(),
+        ))
+    return repos
+
+
 def _resolve_feature_type(alert):
     """Normalize feature_type.
     Package CVEs have empty feature_type but category 'Vulnerabilities'.
@@ -233,12 +371,16 @@ def alert_branch_name(alert_id):
     return f"fix/orca-{alert_id.replace('/', '-')}"
 
 
-def branch_exists_remote(branch_name):
-    """Check if branch exists on remote origin."""
+def branch_exists_remote(branch_name, cwd=None):
+    """Check if branch exists on remote origin.
+
+    cwd: working directory for the git command (None = inherit from caller).
+         Pass repo.clone_path in multi-repo mode.
+    """
     try:
         result = subprocess.run(
             ["git", "ls-remote", "--heads", "origin", branch_name],
-            capture_output=True, text=True, timeout=10
+            capture_output=True, text=True, timeout=10, cwd=cwd
         )
         return bool(result.stdout.strip())
     except Exception:

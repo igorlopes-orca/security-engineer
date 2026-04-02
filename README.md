@@ -28,6 +28,20 @@ Orca alerts
 
 See `.claude/skills/security-engineer/SKILL.md` for the full reference.
 
+## Language coverage
+
+Phase 3 of the validation pipeline runs a local build check. Build root detection uses the alert's source file path (from Orca), so subdirectory apps and monorepos are handled correctly.
+
+| Language | Build check | Root detection |
+|---|---|---|
+| Go | `go build ./...` | walks up to nearest `go.mod` |
+| JavaScript / TypeScript | `npm run build --if-present` | walks up to nearest `package.json` |
+| Python | `python3 -m py_compile` per file | per-file, no root needed |
+| Terraform | `terraform validate` | directory of the changed `.tf` file |
+| Other (YAML, Dockerfile, …) | skipped | — |
+
+If the build tool isn't installed the check is skipped (not failed) — CI in Phase 4 catches regressions.
+
 ## Repository layout
 
 ```

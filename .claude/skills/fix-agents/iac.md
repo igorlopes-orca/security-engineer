@@ -7,7 +7,7 @@ This covers Dockerfiles, Kubernetes YAML manifests, and Terraform files.
 
 Your branch is already set up. Follow these steps:
 
-1. **Read the source file** — strip the line number from `source`. Use the Read tool.
+1. **Read the source file** — use `file_path` (pre-extracted, no parsing needed). Use the Read tool.
 
 2. **Apply the fix** using the patterns below, guided by `recommendation` and `code_snippet`.
 
