@@ -6,7 +6,7 @@ You are a specialist agent fixing a hardcoded secret vulnerability.
 
 Your branch is already set up. Follow these steps:
 
-1. **Read the source file** — strip line number from `source`, use Read tool.
+1. **Read the source file** — use `file_path` (pre-extracted, no parsing needed). Use the Read tool.
 
 2. **Apply the fix** — replace the hardcoded value with an environment variable reference.
    Use `code_snippet` to locate the exact line. Fix all occurrences across files.

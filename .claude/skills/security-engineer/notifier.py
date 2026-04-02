@@ -31,6 +31,7 @@ class NotificationPayload:
     impact_level: str | None = None
     manual_steps: list[str] = field(default_factory=list)
     concerns: list[str] = field(default_factory=list)
+    detail: str = ""
     succeeded: int = 0
     failed: int = 0
     skipped: int = 0
@@ -51,7 +52,14 @@ class NotifierBackend(Protocol):
 # ---------------------------------------------------------------------------
 
 _CONSOLE_PREFIX = {
+    "clone_started":     "[CLONE]",
+    "clone_succeeded":   "[CLONE]",
+    "clone_failed":      "[CLONE]",
+    "alerts_fetched":    "[LIST] ",
     "fix_started":       "[START]",
+    "fix_planned":       "[PLAN] ",
+    "committed":         "[GIT]  ",
+    "pr_opened":         "[PR]   ",
     "fix_succeeded":     "[OK]   ",
     "fix_failed":        "[FAIL] ",
     "timeout":           "[TOUT] ",
@@ -61,7 +69,14 @@ _CONSOLE_PREFIX = {
 }
 
 _CONSOLE_MSG = {
+    "clone_started":     "Cloning {repo}",
+    "clone_succeeded":   "Cloned {repo} → {detail}",
+    "clone_failed":      "Clone failed for {repo}: {reason}",
+    "alerts_fetched":    "{repo}: {detail}",
     "fix_started":       "Fix started for {alert_id} ({feature_type}, {risk_level})",
+    "fix_planned":       "{alert_id} dry-run plan ready",
+    "committed":         "{alert_id} committed ({detail})",
+    "pr_opened":         "{alert_id} PR opened: {pr_url}",
     "fix_succeeded":     "{alert_id} fixed — PR: {pr_url}",
     "fix_failed":        "{alert_id} failed: {reason}",
     "timeout":           "{alert_id} timed out",
@@ -86,7 +101,7 @@ class LogFileNotifier:
         self.log_path = log_path
 
     def send(self, payload: NotificationPayload) -> None:
-        entry = {k: v for k, v in vars(payload).items() if v is not None and v != [] and v != 0}
+        entry = {k: v for k, v in vars(payload).items() if v is not None and v != [] and v != 0 and v != ""}
         with open(self.log_path, "a") as f:
             f.write(json.dumps(entry) + "\n")
 

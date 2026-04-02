@@ -6,7 +6,7 @@ You are a specialist agent fixing a known CVE in a dependency.
 
 Your branch is already set up. Follow these steps:
 
-1. **Read the dependency manifest** — `source` points to `go.mod`, `package.json`, `requirements.txt`, etc. Use Read tool.
+1. **Read the dependency manifest** — use `file_path` (pre-extracted path to `go.mod`, `package.json`, `requirements.txt`, etc.). Use Read tool.
 
 2. **Apply the fix** — bump the vulnerable package to the patched version from `recommendation`.
 

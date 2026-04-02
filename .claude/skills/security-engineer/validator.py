@@ -164,38 +164,78 @@ def _dominant_ext(files: list[str]) -> str | None:
     return max(counts, key=counts.get) if counts else None
 
 
-def local_build_check(files_changed: list[str], worktree_path: Path) -> ValidationResult:
-    ext = _dominant_ext(files_changed)
+def local_build_check(
+    files_changed: list[str],
+    worktree_path: Path,
+    source_file: str = "",
+) -> ValidationResult:
+    """Run a language-appropriate build check after a fix is applied.
+
+    source_file: the affected file path from the Orca alert (authoritative).
+                 Used as the primary seed for project-root detection; falls back
+                 to files_changed if empty.
+    """
+    # Seed with the alert's source file first — it's authoritative and available
+    # before the fix agent runs, unlike files_changed which comes from agent output.
+    all_files = ([source_file] if source_file else []) + list(files_changed)
+
+    ext = _dominant_ext(all_files)
     if not ext:
         return ValidationResult(passed=True, phase="local_build")
 
     if ext == ".go":
-        go_root = _find_go_module_root(files_changed, worktree_path)
+        go_root = _find_project_root(all_files, worktree_path, "go.mod")
         return _run_check(["go", "build", "./..."], go_root)
     elif ext == ".py":
         return _check_python(files_changed, worktree_path)
     elif ext in (".js", ".ts"):
-        return _run_check(["npm", "run", "build", "--if-present"], worktree_path)
+        npm_root = _find_project_root(all_files, worktree_path, "package.json")
+        return _run_check(["npm", "run", "build", "--if-present"], npm_root)
     elif ext == ".tf":
-        return _run_check(["terraform", "validate"], worktree_path)
+        tf_root = _find_terraform_root(all_files, worktree_path)
+        return _run_check(["terraform", "validate"], tf_root)
     else:
         # No build check for YAML/Dockerfile/etc. — skip gracefully
         return ValidationResult(passed=True, phase="local_build")
 
 
-def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
-    """Walk up from each changed .go file to find the nearest go.mod directory."""
+def _find_project_root(files: list[str], worktree_path: Path, marker: str) -> Path:
+    """Walk up from each file to find the nearest directory containing `marker`.
+
+    Works for any project root indicator: go.mod, package.json, etc.
+    Falls back to worktree_path if not found.
+    """
     for f in files:
-        if not f.endswith(".go"):
-            continue
-        candidate = (worktree_path / f).parent
+        # Strip line number suffix (e.g. "nodejs-app/server.js:40" → "nodejs-app/server.js")
+        clean = f.split(":")[0] if ":" in f else f
+        candidate = (worktree_path / clean).parent
         while candidate >= worktree_path:
-            if (candidate / "go.mod").exists():
+            if (candidate / marker).exists():
                 return candidate
             if candidate == worktree_path:
                 break
             candidate = candidate.parent
     return worktree_path
+
+
+def _find_terraform_root(files: list[str], worktree_path: Path) -> Path:
+    """Find the directory containing .tf files — the terraform module root."""
+    for f in files:
+        if not f.endswith(".tf"):
+            continue
+        tf_dir = (worktree_path / f).parent
+        if tf_dir.exists():
+            return tf_dir
+    return worktree_path
+
+
+# Keep old names as aliases for backward compat with existing callers/tests
+def _find_package_json_root(files: list[str], worktree_path: Path) -> Path:
+    return _find_project_root(files, worktree_path, "package.json")
+
+
+def _find_go_module_root(files: list[str], worktree_path: Path) -> Path:
+    return _find_project_root(files, worktree_path, "go.mod")
 
 
 def _run_check(cmd: list[str], cwd: Path) -> ValidationResult:

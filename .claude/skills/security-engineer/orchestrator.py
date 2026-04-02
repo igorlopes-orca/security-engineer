@@ -9,8 +9,10 @@ opens PRs, polls CI, and notifies.
 Usage: python3 orchestrator.py [filter_tokens] [--dry-run] [--alert ID] [--max N] [owner/repo]
 """
 import argparse
+import copy
 import json
 import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,7 +25,7 @@ _SKILLS_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
-from orca_client import RISK_ORDER, alert_branch_name
+from orca_client import RISK_ORDER, alert_branch_name, Repository, list_repositories, get_token
 
 from _json_util import find_last_json_with_key
 from notifier import build_notifiers, NotificationPayload
@@ -33,6 +35,7 @@ from impact_agent import analyze_impact, ImpactResult
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
 
 MAX_WORKERS = 4
+REPO_WORKERS = 3    # concurrent repos in --all-repos mode (total agents = REPO_WORKERS × MAX_WORKERS)
 MAX_RETRIES = 2
 RETRYABLE_ERRORS = {"json_parse_failure", "subprocess_error"}
 TIMEOUTS = {"sast": 180, "iac": 120, "secret": 120, "cve": 240}
@@ -88,29 +91,34 @@ def _run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None) -> tupl
 # Git worktree helpers
 # ---------------------------------------------------------------------------
 
-def _create_worktree(alert_id: str, branch: str) -> Path:
-    """Create an isolated git worktree with a new branch checked out from main."""
-    # Use a deterministic path so we can clean up reliably across runs
+def _create_worktree(alert_id: str, branch: str, repo: Optional[Repository] = None) -> Path:
+    """Create an isolated git worktree with a new branch checked out from main.
+
+    repo: when set (multi-repo mode) all git commands run inside repo.clone_path.
+          When None, uses the current working directory (single-repo mode).
+    """
     path = Path(f"/tmp/orca-fix-{alert_id}")
+    cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
     if path.exists():
-        # Leftover from a previous failed/dry-run — remove it
-        subprocess.run(["git", "worktree", "remove", "--force", str(path)], capture_output=True)
-    # Also delete the local branch if it exists from a previous run
-    subprocess.run(["git", "branch", "-D", branch], capture_output=True)
-    _run(["git", "worktree", "add", "-b", branch, str(path), "main"])
+        subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                       capture_output=True, cwd=cwd)
+    subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
+    _run(["git", "worktree", "add", "-b", branch, str(path), "main"], cwd=cwd)
     return path
 
 
-def _remove_worktree(path: Optional[Path], branch: Optional[str] = None) -> None:
-    """Remove worktree and clean up local branch (prevents stale branches from dry-runs)."""
+def _remove_worktree(path: Optional[Path], branch: Optional[str] = None,
+                     repo: Optional[Repository] = None) -> None:
+    """Remove worktree and clean up local branch.
+
+    repo: when set (multi-repo mode) git commands run inside repo.clone_path.
+    """
+    cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
     if path and path.exists():
-        subprocess.run(
-            ["git", "worktree", "remove", "--force", str(path)],
-            capture_output=True
-        )
+        subprocess.run(["git", "worktree", "remove", "--force", str(path)],
+                       capture_output=True, cwd=cwd)
     if branch:
-        # Delete local branch — silently OK if already gone (e.g. after push)
-        subprocess.run(["git", "branch", "-D", branch], capture_output=True)
+        subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
 
 
 def _get_diff(worktree_path: Path) -> str:
@@ -125,8 +133,23 @@ def _get_diff(worktree_path: Path) -> str:
 _FIX_PROMPT_LIVE = """\
 You are a specialist security fix agent. Fix ONE specific vulnerability.
 
-## Alert Details
-{alert_json}
+## Vulnerability
+**Alert:** {alert_id}  |  **Severity:** {risk_level}  |  **Type:** {feature_type}
+**Title:** {title}
+
+## Location
+**File:** {file_path}
+**Lines:** {lines}
+
+## Vulnerable Code
+{code_snippet}
+
+## Why It's Vulnerable
+{description}
+{ai_triage_explanation}
+
+## Recommended Fix
+{recommendation}
 
 ## Instructions
 {instructions}
@@ -134,8 +157,11 @@ You are a specialist security fix agent. Fix ONE specific vulnerability.
 ## Important
 - Your branch is already created and checked out. Do NOT run git-setup.
 - Do NOT run git commit or git push. The orchestrator handles those after validation.
-- Apply the fix to the file, then verify the change was applied correctly.
+- Apply the fix, then verify the change was applied correctly.
 - Print ONLY the JSON block below as your very last output (nothing after it).
+
+## Full Alert Data (reference)
+{alert_json}
 
 ## Required Final Output
 Success:
@@ -150,20 +176,69 @@ DRY RUN — read files only, do not edit anything.
 
 You are reviewing what a fix would look like for this vulnerability.
 
-## Alert Details
-{alert_json}
+## Vulnerability
+**Alert:** {alert_id}  |  **Severity:** {risk_level}  |  **Type:** {feature_type}
+**Title:** {title}
+
+## Location
+**File:** {file_path}
+**Lines:** {lines}
+
+## Vulnerable Code
+{code_snippet}
+
+## Why It's Vulnerable
+{description}
+{ai_triage_explanation}
+
+## Recommended Fix
+{recommendation}
 
 ## Instructions (reference only — do not execute git or edit commands)
 {instructions}
 
 Describe the planned fix:
-1. Read the source file at the path in "source".
+1. Read the file at {file_path}.
 2. Show before/after of what the fix would look like.
 3. Explain why this addresses the vulnerability.
 
+## Full Alert Data (reference)
+{alert_json}
+
 Print ONLY this JSON as your very last output:
-{{"status": "success", "alert_id": "{alert_id}", "files_changed": ["path/to/file"], "diff_summary": "<planned change>", "manual_steps": []}}
+{{"status": "success", "alert_id": "{alert_id}", "files_changed": ["{file_path}"], "diff_summary": "<planned change>", "manual_steps": []}}
 """
+
+
+def _build_prompt_context(alert: dict) -> dict:
+    """Extract structured fields from alert JSON for fix agent prompts."""
+    position = alert.get("position", {}) or {}
+    start_line = position.get("start_line")
+    end_line = position.get("end_line")
+    if start_line and end_line and start_line != end_line:
+        lines = f"{start_line}–{end_line}"
+    elif start_line:
+        lines = str(start_line)
+    else:
+        lines = "see recommendation"
+
+    raw_snippet = alert.get("code_snippet", [])
+    code_snippet = (
+        "\n".join(str(s) for s in raw_snippet) if isinstance(raw_snippet, list)
+        else str(raw_snippet)
+    ) or "(not available)"
+
+    ai_triage = alert.get("ai_triage", {}) or {}
+    ai_explanation = ai_triage.get("explanation", "")
+
+    return {
+        "file_path":            alert.get("file_path") or alert.get("source", "(unknown)"),
+        "lines":                lines,
+        "code_snippet":         code_snippet,
+        "description":          alert.get("description", ""),
+        "ai_triage_explanation": ai_explanation,
+        "recommendation":       alert.get("recommendation", ""),
+    }
 
 
 def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int) -> FixAgentResult:
@@ -183,10 +258,15 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int) -> FixAg
         tmpl = _FIX_PROMPT_LIVE
         tools = "Read,Edit,Write,Bash"
 
+    ctx = _build_prompt_context(task.alert_json)
     prompt = tmpl.format(
         alert_json=json.dumps(task.alert_json, indent=2),
         instructions=instructions,
         alert_id=task.alert_id,
+        title=task.title,
+        risk_level=task.risk_level,
+        feature_type=task.feature_type,
+        **ctx,
     )
 
     cmd = [
@@ -327,13 +407,18 @@ def _notify_payload(task: AlertTask) -> NotificationPayload:
     )
 
 
-def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
-    """Drive a single alert through the full fix pipeline."""
+def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> AlertTask:
+    """Drive a single alert through the full fix pipeline.
+
+    repo.clone_path controls where git operations run:
+      None  → current working directory (single-repo mode, existing behaviour)
+      Path  → inside the cloned repo (multi-repo mode)
+    """
     branch = alert_branch_name(task.alert_id)
 
     # Create worktree
     try:
-        task.worktree_path = _create_worktree(task.alert_id, branch)
+        task.worktree_path = _create_worktree(task.alert_id, branch, repo=repo)
     except RuntimeError as e:
         if "already exists" in str(e):
             task.state = "SKIPPED"
@@ -344,7 +429,7 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         return task
 
     p = _notify_payload(task)
-    p.repo = repo
+    p.repo = repo.name
     notifier.notify("fix_started", p)
 
     # Fix agent with retries
@@ -360,9 +445,9 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
             task.state = "TIMED_OUT"
             task.failure_reason = fix_result.failure_reason
             p = _notify_payload(task)
-            p.repo = repo
+            p.repo = repo.name
             notifier.notify("timeout", p)
-            _remove_worktree(task.worktree_path, branch)
+            _remove_worktree(task.worktree_path, branch, repo=repo)
             return task
 
         if fix_result.success:
@@ -378,9 +463,9 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         task.state = "FAILED"
         task.failure_reason = (fix_result.failure_reason if fix_result else "unknown")
         p = _notify_payload(task)
-        p.repo = repo
+        p.repo = repo.name
         notifier.notify("fix_failed", p)
-        _remove_worktree(task.worktree_path, branch)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     task.fix_result = fix_result
@@ -388,7 +473,11 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
     # Dry-run: done after fix agent describes the plan
     if dry_run:
         task.state = "DONE"
-        _remove_worktree(task.worktree_path, branch)
+        p = _notify_payload(task)
+        p.repo = repo.name
+        p.detail = fix_result.diff_summary or ""
+        notifier.notify("fix_planned", p)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Phase 1: sanity
@@ -398,10 +487,10 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         task.state = "FAILED"
         task.failure_reason = "; ".join(sanity.failures)
         p = _notify_payload(task)
-        p.repo = repo
+        p.repo = repo.name
         notifier.notify("validation_failed", p)
         _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Phase 2: LLM validation
@@ -410,24 +499,27 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         task.state = "FAILED"
         task.failure_reason = "; ".join(llm_val.failures)
         p = _notify_payload(task)
-        p.repo = repo
+        p.repo = repo.name
         notifier.notify("validation_failed", p)
         _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
     if llm_val.needs_review:
         task.needs_review = True
 
     # Phase 3: local build
-    local_val = local_build_check(fix_result.files_changed, task.worktree_path)
+    local_val = local_build_check(
+        fix_result.files_changed, task.worktree_path,
+        source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
+    )
     if not local_val.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(local_val.failures)
         p = _notify_payload(task)
-        p.repo = repo
+        p.repo = repo.name
         notifier.notify("validation_failed", p)
         _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Impact analysis
@@ -443,12 +535,22 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         task.state = "FAILED"
         task.failure_reason = str(e)
         p = _notify_payload(task)
-        p.repo = repo
+        p.repo = repo.name
         notifier.notify("fix_failed", p)
-        _remove_worktree(task.worktree_path, branch)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     task.pr_url = pr_url
+
+    p = _notify_payload(task)
+    p.repo = repo.name
+    notifier.notify("committed", p)
+
+    if pr_url:
+        p = _notify_payload(task)
+        p.repo = repo.name
+        notifier.notify("pr_opened", p)
+
     task.state = "PR_OPENING"
 
     # Phase 4: CI gate
@@ -463,7 +565,7 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
                 capture_output=True
             )
             p = _notify_payload(task)
-            p.repo = repo
+            p.repo = repo.name
             notifier.notify("ci_failed", p)
         else:
             task.state = "DONE"
@@ -485,9 +587,9 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
         )
 
     p = _notify_payload(task)
-    p.repo = repo
+    p.repo = repo.name
     notifier.notify("fix_succeeded", p)
-    _remove_worktree(task.worktree_path, branch)
+    _remove_worktree(task.worktree_path, branch, repo=repo)
     return task
 
 
@@ -495,22 +597,27 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: str) -> AlertTask:
 # Fetch and plan
 # ---------------------------------------------------------------------------
 
-def _detect_repo() -> Optional[str]:
+def _detect_repo() -> Optional[Repository]:
+    """Auto-detect the current repo from git remote and return a Repository object."""
     try:
         stdout, _, _ = _run(["git", "remote", "get-url", "origin"], check=False)
-        if "github.com/" in stdout:
-            return stdout.split("github.com/")[-1].removesuffix(".git")
-        if "github.com:" in stdout:
-            return stdout.split("github.com:")[-1].removesuffix(".git")
+        url = stdout.strip()
+        for sep in ("github.com/", "github.com:"):
+            if sep in url:
+                name = url.split(sep)[-1].removesuffix(".git").strip("/")
+                return Repository(name=name, url=url)
     except Exception:
         pass
     return None
 
 
-def _fetch_and_plan(args) -> tuple[list[AlertTask], list[dict], list[dict], list[dict]]:
-    cmd = ["python3", _RUN_AGENT, "list-alerts"]
-    if args.repo:
-        cmd.append(args.repo)
+def _fetch_and_plan(args, repo: Repository) -> tuple[list[AlertTask], list[dict], list[dict], list[dict]]:
+    """Fetch alerts for a repo and partition them into fix/skip/scm/unfixable buckets.
+
+    repo.clone_path: when set, passes --repo-dir to run_agent.py so git ops
+                     (detect_repo, branch_exists_remote) run inside the clone.
+    """
+    cmd = ["python3", _RUN_AGENT, "list-alerts", repo.name]
     if args.alert:
         cmd += ["--alert", args.alert]
     else:
@@ -519,6 +626,8 @@ def _fetch_and_plan(args) -> tuple[list[AlertTask], list[dict], list[dict], list
         if args.max:
             cmd += ["--max", str(args.max)]
     cmd.append("--fixable-only")
+    if repo.clone_path:
+        cmd += ["--repo-dir", str(repo.clone_path)]
 
     stdout, _, _ = _run(cmd)
     data = json.loads(stdout)
@@ -618,6 +727,146 @@ def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: lis
 
 
 # ---------------------------------------------------------------------------
+# Multi-repo pipeline
+# ---------------------------------------------------------------------------
+
+def _clone_repo(repo: Repository) -> Repository:
+    """Shallow-clone a GitHub repo into /tmp. Fills repo.clone_path in-place."""
+    safe = repo.name.replace("/", "-")
+    path = Path(f"/tmp/orca-global-{safe}")
+    if path.exists():
+        shutil.rmtree(path)
+    _run(["gh", "repo", "clone", repo.url, str(path), "--", "--depth=1"])
+    repo.clone_path = path
+    return repo
+
+
+def _repo_notif(repo: Repository) -> NotificationPayload:
+    """Bare payload for repo-level events (no alert context)."""
+    return NotificationPayload(event="", alert_id="", feature_type="", risk_level="", repo=repo.name)
+
+
+def _run_repo_pipeline(repo: Repository, args) -> dict:
+    """Clone a repo, run the full fix pipeline against it, clean up the clone.
+
+    Returns a dict with keys: results, skipped, scm_posture, unfixable, error.
+    """
+    notifier = build_notifiers(repo.name, _THIS_DIR)
+
+    p = _repo_notif(repo)
+    notifier.notify("clone_started", p)
+    try:
+        _clone_repo(repo)
+    except RuntimeError as e:
+        p = _repo_notif(repo)
+        p.reason = str(e)
+        notifier.notify("clone_failed", p)
+        return {"results": [], "skipped": [], "scm_posture": [], "unfixable": [],
+                "error": f"clone failed: {e}"}
+
+    p = _repo_notif(repo)
+    p.detail = str(repo.clone_path)
+    notifier.notify("clone_succeeded", p)
+
+    try:
+        local_args = copy.copy(args)
+        local_args.repo = repo.name  # ensure filter uses this repo, not auto-detect
+
+        to_fix, skipped, scm_posture, unfixable = _fetch_and_plan(local_args, repo)
+
+        p = _repo_notif(repo)
+        p.detail = f"{len(to_fix)} to fix, {len(skipped)} skipped, {len(unfixable)} unfixable"
+        notifier.notify("alerts_fetched", p)
+
+        _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run)
+
+        results: list[AlertTask] = []
+        if to_fix:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                futures = {
+                    pool.submit(run_one, task, args.dry_run, notifier, repo): task
+                    for task in to_fix
+                }
+                for future in as_completed(futures):
+                    try:
+                        results.append(future.result())
+                    except Exception as e:
+                        task = futures[future]
+                        task.state = "FAILED"
+                        task.failure_reason = str(e)
+                        results.append(task)
+
+        return {"results": results, "skipped": skipped,
+                "scm_posture": scm_posture, "unfixable": unfixable, "error": None}
+    finally:
+        if repo.clone_path and repo.clone_path.exists():
+            shutil.rmtree(repo.clone_path, ignore_errors=True)
+            repo.clone_path = None
+
+
+def _print_global_summary(all_results: dict, dry_run: bool = False) -> None:
+    """Print a per-repo breakdown and aggregate totals for --all-repos runs."""
+    total_done = total_failed = total_skipped = 0
+
+    print("\n## Security Engineer — Global Run Summary\n")
+    for repo_name, data in sorted(all_results.items()):
+        if data.get("error"):
+            print(f"### {repo_name} — ERROR: {data['error']}")
+            continue
+        results = data.get("results", [])
+        skipped = data.get("skipped", [])
+        scm = data.get("scm_posture", [])
+        _print_summary(results, skipped, scm, repo_name, dry_run)
+        done = sum(1 for t in results if t.state in ("DONE", "CI_FAILED"))
+        failed = sum(1 for t in results if t.state in ("FAILED", "TIMED_OUT"))
+        total_done += done
+        total_failed += failed
+        total_skipped += len(skipped)
+
+    print(f"\n---\n**Totals** — Fixed: {total_done}  |  Failed: {total_failed}  |  Skipped: {total_skipped}")
+
+
+def _get_repo_url(repo_name: str) -> str:
+    """Resolve the clone URL for an owner/repo via gh CLI."""
+    stdout, _, _ = _run(["gh", "repo", "view", repo_name, "--json", "url", "--jq", ".url"])
+    return stdout.strip()
+
+
+def run_all_repos(args) -> None:
+    """Discover all repos with open Orca alerts and run the fix pipeline on each."""
+    token = get_token()
+    repos = list_repositories(token)
+    if not repos:
+        print("No repositories with open alerts found in Orca.")
+        return
+
+    mode = "DRY-RUN" if args.dry_run else "LIVE"
+    print(f"\nFound {len(repos)} repositories with open alerts. Mode: {mode}")
+    print(f"Processing up to {REPO_WORKERS} repos concurrently "
+          f"(up to {REPO_WORKERS * MAX_WORKERS} parallel fix agents).\n")
+    for r in repos:
+        print(f"  {r.name}  [{r.risk_level or 'unknown'}]  {r.url}")
+
+    all_results: dict = {}
+    with ThreadPoolExecutor(max_workers=REPO_WORKERS) as executor:
+        futures = {
+            executor.submit(_run_repo_pipeline, r, args): r
+            for r in repos
+        }
+        for future in as_completed(futures):
+            r = futures[future]
+            try:
+                all_results[r.name] = future.result()
+            except Exception as e:
+                all_results[r.name] = {
+                    "results": [], "skipped": [], "scm_posture": [], "unfixable": [],
+                    "error": str(e),
+                }
+
+    _print_global_summary(all_results, dry_run=args.dry_run)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -625,39 +874,61 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Security Engineer Orchestrator")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan only — fix agents read files but cannot edit")
+    parser.add_argument("--remote", default=None, metavar="REPO",
+                        help="Clone and fix: 'all' for all Orca repos, 'owner/repo' for one")
     parser.add_argument("--alert", default=None,
                         help="Target a single alert ID")
     parser.add_argument("--max", type=int, default=None,
                         help="Cap number of fixes")
     parser.add_argument("positional", nargs="*",
-                        help="[filter_tokens] [owner/repo] e.g. 'high,sast' or 'owner/repo'")
+                        help="[filter_tokens] e.g. 'high,sast' or 'cve'")
     args = parser.parse_args(argv)
 
-    # Classify positional args: contains "/" → repo, otherwise → filter
+    # All positional tokens are filter tokens — repo is always auto-detected from git remote
     args.repo = None
     args.filter_tokens = None
     for p in args.positional:
-        if "/" in p:
-            args.repo = p
+        args.filter_tokens = p
+
+    # --remote: clone-based pipeline (single repo or all Orca repos)
+    if args.remote is not None:
+        if args.dry_run:
+            print("Mode: DRY-RUN — fix agents will read files and plan fixes, cannot edit.")
+        if args.remote == "all":
+            run_all_repos(args)
+        elif "/" in args.remote:
+            try:
+                url = _get_repo_url(args.remote)
+            except RuntimeError as e:
+                sys.exit(f"Error: could not resolve URL for {args.remote}: {e}")
+            repo = Repository(name=args.remote, url=url)
+            data = _run_repo_pipeline(repo, args)
+            if data.get("error"):
+                sys.exit(f"Pipeline failed: {data['error']}")
+            _print_summary(data["results"], data["skipped"], data["scm_posture"],
+                           args.remote, args.dry_run)
         else:
-            args.filter_tokens = p
+            sys.exit("Error: --remote requires 'all' or 'owner/repo'")
+        return
 
-    repo = args.repo or _detect_repo()
+    # Local mode — repo always auto-detected from git remote origin
+    repo = _detect_repo()
     if not repo:
-        sys.exit("Error: could not detect repo. Pass owner/repo as argument.")
+        sys.exit("Error: could not detect repo from git remote. "
+                 "Run from inside a git repo or use --remote owner/repo.")
 
-    notifier = build_notifiers(repo, _THIS_DIR)
+    notifier = build_notifiers(repo.name, _THIS_DIR)
 
     if args.dry_run:
         print("Mode: DRY-RUN — fix agents will read files and plan fixes, cannot edit.")
 
-    to_fix, skipped, scm_posture, unfixable = _fetch_and_plan(args)
-    _print_plan(to_fix, skipped, scm_posture, unfixable, repo, args.dry_run)
+    to_fix, skipped, scm_posture, unfixable = _fetch_and_plan(args, repo)
+    _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run)
 
     if not to_fix:
         notifier.notify("run_complete", NotificationPayload(
             event="run_complete", alert_id="-", feature_type="-", risk_level="-",
-            repo=repo, succeeded=0, failed=0, skipped=len(skipped),
+            repo=repo.name, succeeded=0, failed=0, skipped=len(skipped),
         ))
         return
 
@@ -676,13 +947,13 @@ def main(argv=None):
                 task.failure_reason = str(e)
                 results.append(task)
 
-    _print_summary(results, skipped, scm_posture, repo, args.dry_run)
+    _print_summary(results, skipped, scm_posture, repo.name, args.dry_run)
 
     succeeded = sum(1 for t in results if t.state in ("DONE", "CI_FAILED"))
     failed = sum(1 for t in results if t.state in ("FAILED", "TIMED_OUT"))
     notifier.notify("run_complete", NotificationPayload(
         event="run_complete", alert_id="-", feature_type="-", risk_level="-",
-        repo=repo, succeeded=succeeded, failed=failed, skipped=len(skipped),
+        repo=repo.name, succeeded=succeeded, failed=failed, skipped=len(skipped),
     ))
 
 

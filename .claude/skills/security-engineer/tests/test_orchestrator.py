@@ -21,7 +21,7 @@ sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 import orchestrator
 from orchestrator import main, _invoke_fix_agent, _commit_and_pr, AlertTask, FixAgentResult
 from run_agent import parse_filter, min_level_from_list
-from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER
+from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
 
 
 # ---------------------------------------------------------------------------
@@ -42,10 +42,7 @@ class TestArgumentParsing(unittest.TestCase):
         args.repo = None
         args.filter_tokens = None
         for p in args.positional:
-            if "/" in p:
-                args.repo = p
-            else:
-                args.filter_tokens = p
+            args.filter_tokens = p
         return args
 
     def test_dry_run_before_filter(self):
@@ -70,11 +67,11 @@ class TestArgumentParsing(unittest.TestCase):
         args = self._parse(["high,cve"])
         self.assertFalse(args.dry_run)
 
-    def test_filter_and_repo(self):
-        args = self._parse(["high", "owner/repo"])
+    def test_filter_only_no_repo_positional(self):
+        """Positional args are only filter tokens — owner/repo is never accepted here."""
+        args = self._parse(["high"])
         self.assertEqual(args.filter_tokens, "high")
-        self.assertEqual(args.repo, "owner/repo")
-        self.assertFalse(args.dry_run)
+        self.assertIsNone(args.repo)
 
     def test_max_cap(self):
         args = self._parse(["--max", "3", "cve"])
@@ -324,7 +321,11 @@ class TestDryRunEnforcement(unittest.TestCase):
             mock_fix.return_value = FixAgentResult(success=True, diff_summary="planned fix")
             mock_notifier = MagicMock()
 
-            result = orchestrator.run_one(task, dry_run=True, notifier=mock_notifier, repo="owner/repo")
+            from orca_client import Repository
+            result = orchestrator.run_one(
+                task, dry_run=True, notifier=mock_notifier,
+                repo=Repository(name="owner/repo", url="https://github.com/owner/repo"),
+            )
 
         self.assertEqual(result.state, "DONE")
         mock_sanity.assert_not_called()
@@ -373,6 +374,527 @@ class TestFixResultParsing(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 7. list_repositories: URL parsing and deduplication
+# ---------------------------------------------------------------------------
+
+class TestListRepositories(unittest.TestCase):
+    """Table-driven: name extraction from Orca CodeRepository response."""
+
+    CASES = [
+        # (description, url, expected_name)
+        ("https no .git",       "https://github.com/owner/repo",      "owner/repo"),
+        ("https with .git",     "https://github.com/owner/repo.git",   "owner/repo"),
+        ("ssh colon format",    "git@github.com:owner/repo.git",       "owner/repo"),
+        ("ssh no .git suffix",  "git@github.com:owner/repo",           "owner/repo"),
+    ]
+
+    def _fake_response(self, *urls):
+        return {"data": [{"Url": u, "OrcaScore": 5.0, "RiskLevel": "high"} for u in urls]}
+
+    def test_url_to_name_extraction(self):
+        from orca_client import list_repositories
+        for desc, url, expected in self.CASES:
+            with self.subTest(desc):
+                with patch("orca_client._post", return_value=self._fake_response(url)):
+                    repos = list_repositories("fake-token")
+                self.assertEqual(len(repos), 1)
+                self.assertEqual(repos[0].name, expected)
+                self.assertEqual(repos[0].url, url)
+                self.assertIsNone(repos[0].clone_path)
+
+    def test_deduplication_by_url(self):
+        """Same URL appearing twice must produce exactly one Repository."""
+        from orca_client import list_repositories
+        url = "https://github.com/owner/repo"
+        with patch("orca_client._post", return_value=self._fake_response(url, url)):
+            repos = list_repositories("fake-token")
+        self.assertEqual(len(repos), 1)
+
+    def test_empty_url_skipped(self):
+        """Items with no URL must be silently dropped."""
+        from orca_client import list_repositories
+        with patch("orca_client._post", return_value=self._fake_response(
+            "", "https://github.com/owner/other"
+        )):
+            repos = list_repositories("fake-token")
+        self.assertEqual(len(repos), 1)
+        self.assertEqual(repos[0].name, "owner/other")
+
+    def test_empty_response(self):
+        from orca_client import list_repositories
+        with patch("orca_client._post", return_value={"data": []}):
+            repos = list_repositories("fake-token")
+        self.assertEqual(repos, [])
+
+
+# ---------------------------------------------------------------------------
+# 8. _detect_repo returns Repository
+# ---------------------------------------------------------------------------
+
+class TestDetectRepoReturnsRepository(unittest.TestCase):
+    """Table-driven: _detect_repo produces the right Repository for each URL format."""
+
+    CASES = [
+        # (description, git_remote_url, expected_name)
+        ("https no .git",   "https://github.com/owner/repo",     "owner/repo"),
+        ("https with .git", "https://github.com/owner/repo.git",  "owner/repo"),
+        ("ssh colon",       "git@github.com:owner/repo.git",      "owner/repo"),
+    ]
+
+    def test_url_formats(self):
+        for desc, url, expected_name in self.CASES:
+            with self.subTest(desc):
+                with patch("orchestrator._run", return_value=(url, "", 0)):
+                    repo = orchestrator._detect_repo()
+                self.assertIsNotNone(repo, f"should detect repo for {desc}")
+                self.assertIsInstance(repo, Repository)
+                self.assertEqual(repo.name, expected_name)
+                self.assertEqual(repo.url, url)
+                self.assertIsNone(repo.clone_path)
+
+    def test_non_github_url_returns_none(self):
+        with patch("orchestrator._run", return_value=("https://gitlab.com/owner/repo", "", 0)):
+            self.assertIsNone(orchestrator._detect_repo())
+
+    def test_git_error_returns_none(self):
+        with patch("orchestrator._run", side_effect=RuntimeError("not a git repo")):
+            self.assertIsNone(orchestrator._detect_repo())
+
+
+# ---------------------------------------------------------------------------
+# 9. _fetch_and_plan: --repo-dir present iff clone_path is set
+# ---------------------------------------------------------------------------
+
+class TestFetchAndPlanRepoDir(unittest.TestCase):
+    """Table-driven: --repo-dir flag in cmd based on repo.clone_path."""
+
+    CASES = [
+        # (description, clone_path, expect_repo_dir_flag)
+        ("no clone path → no --repo-dir",    None,                              False),
+        ("with clone path → has --repo-dir", Path("/tmp/orca-global-owner-repo"), True),
+    ]
+
+    def _args(self):
+        import argparse
+        return argparse.Namespace(filter_tokens=None, max=None, alert=None, dry_run=False)
+
+    def test_repo_dir_flag(self):
+        for desc, clone_path, expect_flag in self.CASES:
+            with self.subTest(desc):
+                repo = Repository(name="owner/repo",
+                                  url="https://github.com/owner/repo",
+                                  clone_path=clone_path)
+                captured = {}
+
+                def fake_run(cmd, **kwargs):
+                    captured["cmd"] = list(cmd)
+                    return ('{"alerts": []}', "", 0)
+
+                with patch("orchestrator._run", side_effect=fake_run):
+                    orchestrator._fetch_and_plan(self._args(), repo)
+
+                has_flag = "--repo-dir" in captured.get("cmd", [])
+                self.assertEqual(has_flag, expect_flag, desc)
+                if expect_flag:
+                    idx = captured["cmd"].index("--repo-dir")
+                    self.assertEqual(captured["cmd"][idx + 1], str(clone_path))
+
+
+# ---------------------------------------------------------------------------
+# 10. Worktree helpers: cwd follows repo.clone_path
+# ---------------------------------------------------------------------------
+
+class TestWorktreeCwd(unittest.TestCase):
+    """Table-driven: git commands in _create_worktree/_remove_worktree use correct cwd."""
+
+    CASES = [
+        # (description, clone_path, expected_cwd)
+        ("no clone path → cwd None",   None,                          None),
+        ("clone path → cwd str",       Path("/tmp/orca-global-test"), "/tmp/orca-global-test"),
+    ]
+
+    def test_create_worktree_cwd(self):
+        for desc, clone_path, expected_cwd in self.CASES:
+            with self.subTest(desc):
+                repo = Repository(name="owner/repo",
+                                  url="https://github.com/owner/repo",
+                                  clone_path=clone_path)
+                captured = {}
+
+                def fake_run(cmd, **kwargs):
+                    captured["cwd"] = kwargs.get("cwd")
+                    return ("", "", 0)
+
+                with patch("orchestrator._run", side_effect=fake_run), \
+                     patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+                     patch.object(Path, "exists", return_value=False):
+                    orchestrator._create_worktree("orca-test", "fix/orca-test", repo=repo)
+
+                self.assertEqual(captured.get("cwd"), expected_cwd, desc)
+
+    def test_remove_worktree_cwd(self):
+        for desc, clone_path, expected_cwd in self.CASES:
+            with self.subTest(desc):
+                repo = Repository(name="owner/repo",
+                                  url="https://github.com/owner/repo",
+                                  clone_path=clone_path)
+                cwd_values = []
+
+                def fake_subprocess(cmd, **kwargs):
+                    cwd_values.append(kwargs.get("cwd"))
+                    return MagicMock(returncode=0)
+
+                with patch("subprocess.run", side_effect=fake_subprocess), \
+                     patch.object(Path, "exists", return_value=True):
+                    orchestrator._remove_worktree(Path("/tmp/fake"), "fix/branch", repo=repo)
+
+                for cwd in cwd_values:
+                    self.assertEqual(cwd, expected_cwd, desc)
+
+
+# ---------------------------------------------------------------------------
+# 11. --remote routing in main()
+# ---------------------------------------------------------------------------
+
+class TestRemoteRouting(unittest.TestCase):
+    """Table-driven: --remote 'all' / 'owner/repo' / invalid routes correctly."""
+
+    CASES = [
+        # (description, argv, all_repos_called, run_repo_pipeline_called, expect_exit)
+        ("all repos",   ["--remote", "all"],           True,  False, False),
+        ("single repo", ["--remote", "owner/repo"],    False, True,  False),
+        ("invalid",     ["--remote", "notvalid"],      False, False, True),
+    ]
+
+    def test_routing(self):
+        for desc, argv, expect_all, expect_single, expect_exit in self.CASES:
+            with self.subTest(desc):
+                with patch("orchestrator.run_all_repos") as mock_all, \
+                     patch("orchestrator._run_repo_pipeline", return_value={
+                         "results": [], "skipped": [], "scm_posture": [],
+                         "unfixable": [], "error": None,
+                     }) as mock_single, \
+                     patch("orchestrator._get_repo_url",
+                           return_value="https://github.com/owner/repo"), \
+                     patch("orchestrator._print_summary"):
+                    if expect_exit:
+                        with self.assertRaises(SystemExit):
+                            main(argv)
+                    else:
+                        main(argv)
+                    self.assertEqual(mock_all.called, expect_all,
+                                     f"{desc}: run_all_repos called={mock_all.called}")
+                    self.assertEqual(mock_single.called, expect_single,
+                                     f"{desc}: _run_repo_pipeline called={mock_single.called}")
+
+    def test_dry_run_propagated_to_pipeline(self):
+        """--remote --dry-run must reach _run_repo_pipeline with dry_run=True."""
+        with patch("orchestrator._run_repo_pipeline", return_value={
+            "results": [], "skipped": [], "scm_posture": [], "unfixable": [], "error": None,
+        }) as mock_pipeline, \
+             patch("orchestrator._get_repo_url", return_value="https://github.com/owner/repo"), \
+             patch("orchestrator._print_summary"):
+            main(["--remote", "owner/repo", "--dry-run"])
+
+        passed_args = mock_pipeline.call_args[0][1]  # second positional = args
+        self.assertTrue(passed_args.dry_run)
+
+
+# ---------------------------------------------------------------------------
+# 12. _run_repo_pipeline: clone cleanup always runs
+# ---------------------------------------------------------------------------
+
+class TestRunRepoPipelineCleanup(unittest.TestCase):
+    """Table-driven: clone dir is removed even when pipeline raises."""
+
+    CASES = [
+        # (description, fetch_raises)
+        ("pipeline succeeds", None),
+        ("pipeline raises",   RuntimeError("unexpected error")),
+    ]
+
+    def _args(self):
+        import argparse
+        return argparse.Namespace(dry_run=False, filter_tokens=None,
+                                  max=None, alert=None, repo=None)
+
+    def test_cleanup_always_runs(self):
+        clone_path = Path("/tmp/orca-global-owner-repo")
+        for desc, fetch_error in self.CASES:
+            with self.subTest(desc):
+                repo = Repository(name="owner/repo",
+                                  url="https://github.com/owner/repo")
+
+                def fake_clone(r):
+                    r.clone_path = clone_path
+                    return r
+
+                def fake_fetch(args, r):
+                    if fetch_error:
+                        raise fetch_error
+                    return [], [], [], []
+
+                with patch("orchestrator._clone_repo", side_effect=fake_clone), \
+                     patch("orchestrator._fetch_and_plan", side_effect=fake_fetch), \
+                     patch("orchestrator.build_notifiers", return_value=MagicMock()), \
+                     patch("shutil.rmtree") as mock_rmtree, \
+                     patch.object(Path, "exists", return_value=True):
+                    try:
+                        orchestrator._run_repo_pipeline(repo, self._args())
+                    except Exception:
+                        pass
+
+                mock_rmtree.assert_called_once_with(clone_path, ignore_errors=True), \
+                    f"{desc}: shutil.rmtree should have been called"
+
+
+# ---------------------------------------------------------------------------
+# Build root detection
+# ---------------------------------------------------------------------------
+
+import tempfile, os
+
+class TestFindPackageJsonRoot(unittest.TestCase):
+    """_find_package_json_root walks up from changed files to locate package.json."""
+
+    from validator import _find_package_json_root
+
+    def _make_tree(self, tmp: Path, structure: dict):
+        """Recursively create files/dirs. Use None for files, dict for dirs."""
+        for name, content in structure.items():
+            path = tmp / name
+            if content is None:
+                path.touch()
+            else:
+                path.mkdir(parents=True, exist_ok=True)
+                self._make_tree(path, content)
+
+    def test_cases(self):
+        from validator import _find_package_json_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            # Build tree:
+            #   package.json          ← root package
+            #   nodejs-app/
+            #     package.json        ← subdirectory package
+            #     server.js
+            #   other-app/
+            #     src/
+            #       index.js          ← no package.json nearby
+            self._make_tree(tmp, {
+                "package.json": None,
+                "nodejs-app": {
+                    "package.json": None,
+                    "server.js": None,
+                },
+                "other-app": {
+                    "src": {"index.js": None},
+                },
+            })
+
+            CASES = [
+                (
+                    "file in subdirectory with own package.json",
+                    ["nodejs-app/server.js"],
+                    tmp / "nodejs-app",
+                ),
+                (
+                    "file at root — uses root package.json",
+                    ["index.js"],
+                    tmp,
+                ),
+                (
+                    "file in deep subdir without package.json — falls back to root",
+                    ["other-app/src/index.js"],
+                    tmp,
+                ),
+                (
+                    "no js files — falls back to root",
+                    ["README.md"],
+                    tmp,
+                ),
+                (
+                    "empty list — falls back to root",
+                    [],
+                    tmp,
+                ),
+            ]
+
+            for desc, files, expected in CASES:
+                with self.subTest(desc):
+                    result = _find_package_json_root(files, tmp)
+                    self.assertEqual(result, expected, desc)
+
+
+class TestFindProjectRoot(unittest.TestCase):
+    """_find_project_root handles source_file with line numbers and Terraform."""
+
+    def _make_tree(self, tmp: Path, structure: dict):
+        for name, content in structure.items():
+            path = tmp / name
+            if content is None:
+                path.touch()
+            else:
+                path.mkdir(parents=True, exist_ok=True)
+                self._make_tree(path, content)
+
+    def test_cases(self):
+        from validator import _find_project_root, _find_terraform_root
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            self._make_tree(tmp, {
+                "package.json": None,
+                "nodejs-app": {
+                    "package.json": None,
+                    "server.js": None,
+                },
+                "infra": {
+                    "main.tf": None,
+                    "variables.tf": None,
+                },
+            })
+
+            CASES = [
+                (
+                    "source_file with line number suffix stripped",
+                    _find_project_root,
+                    ["nodejs-app/server.js:40"],
+                    "package.json",
+                    tmp / "nodejs-app",
+                ),
+                (
+                    "source_file without line number",
+                    _find_project_root,
+                    ["nodejs-app/server.js"],
+                    "package.json",
+                    tmp / "nodejs-app",
+                ),
+                (
+                    "terraform root from .tf file",
+                    _find_terraform_root,
+                    ["infra/main.tf"],
+                    None,
+                    tmp / "infra",
+                ),
+                (
+                    "terraform fallback when no .tf in list",
+                    _find_terraform_root,
+                    ["README.md"],
+                    None,
+                    tmp,
+                ),
+            ]
+
+            for desc, fn, files, marker, expected in CASES:
+                with self.subTest(desc):
+                    if marker:
+                        result = fn(files, tmp, marker)
+                    else:
+                        result = fn(files, tmp)
+                    self.assertEqual(result, expected, desc)
+
+
+# ---------------------------------------------------------------------------
+# Alert data extraction
+# ---------------------------------------------------------------------------
+
+class TestExtractFilePath(unittest.TestCase):
+    """_extract_file_path produces a clean relative path from various Source formats."""
+
+    def test_cases(self):
+        from orca_client import _extract_file_path
+
+        CASES = [
+            ("github blob URL with sha",
+             "https://github.com/owner/repo/blob/abc123def/nodejs-app/server.js",
+             "nodejs-app/server.js"),
+            ("github blob URL with branch name",
+             "https://github.com/owner/repo/blob/main/path/to/file.py",
+             "path/to/file.py"),
+            ("github blob URL with line anchor",
+             "https://github.com/owner/repo/blob/abc123/nodejs-app/server.js#L40",
+             "nodejs-app/server.js"),
+            ("relative path with line number",
+             "nodejs-app/server.js:40",
+             "nodejs-app/server.js"),
+            ("relative path without line number",
+             "nodejs-app/server.js",
+             "nodejs-app/server.js"),
+            ("plain manifest path",
+             "go.mod",
+             "go.mod"),
+            ("empty string",
+             "",
+             ""),
+        ]
+
+        for desc, source, expected in CASES:
+            with self.subTest(desc):
+                self.assertEqual(_extract_file_path(source), expected, desc)
+
+
+class TestBuildPromptContext(unittest.TestCase):
+    """_build_prompt_context extracts structured fields for fix agent prompts."""
+
+    def test_cases(self):
+        from orchestrator import _build_prompt_context
+
+        CASES = [
+            (
+                "full alert with all fields",
+                {
+                    "file_path": "nodejs-app/server.js",
+                    "position": {"start_line": 40, "end_line": 45},
+                    "code_snippet": ["const path = req.query.file", "res.sendFile(path)"],
+                    "description": "Path traversal vulnerability",
+                    "ai_triage": {"explanation": "User input flows to file system"},
+                    "recommendation": "Sanitize the input with path.basename()",
+                },
+                {
+                    "file_path": "nodejs-app/server.js",
+                    "lines": "40–45",
+                    "code_snippet": "const path = req.query.file\nres.sendFile(path)",
+                    "description": "Path traversal vulnerability",
+                    "ai_triage_explanation": "User input flows to file system",
+                    "recommendation": "Sanitize the input with path.basename()",
+                },
+            ),
+            (
+                "single line position",
+                {"file_path": "app.go", "position": {"start_line": 10, "end_line": 10},
+                 "code_snippet": [], "description": "", "ai_triage": {}, "recommendation": ""},
+                {"file_path": "app.go", "lines": "10",
+                 "code_snippet": "(not available)", "description": "",
+                 "ai_triage_explanation": "", "recommendation": ""},
+            ),
+            (
+                "missing position falls back gracefully",
+                {"file_path": "infra/main.tf", "position": {},
+                 "code_snippet": [], "description": "", "ai_triage": {}, "recommendation": ""},
+                {"file_path": "infra/main.tf", "lines": "see recommendation",
+                 "code_snippet": "(not available)", "description": "",
+                 "ai_triage_explanation": "", "recommendation": ""},
+            ),
+            (
+                "falls back to source when file_path missing",
+                {"source": "app.py:12", "position": {},
+                 "code_snippet": [], "description": "", "ai_triage": {}, "recommendation": ""},
+                {"file_path": "app.py:12", "lines": "see recommendation",
+                 "code_snippet": "(not available)", "description": "",
+                 "ai_triage_explanation": "", "recommendation": ""},
+            ),
+        ]
+
+        for desc, alert, expected in CASES:
+            with self.subTest(desc):
+                result = _build_prompt_context(alert)
+                for key, val in expected.items():
+                    self.assertEqual(result[key], val, f"{desc}: {key}")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -387,6 +909,16 @@ if __name__ == "__main__":
         TestFeatureTypeResolution,
         TestDryRunEnforcement,
         TestFixResultParsing,
+        TestListRepositories,
+        TestDetectRepoReturnsRepository,
+        TestFetchAndPlanRepoDir,
+        TestWorktreeCwd,
+        TestRemoteRouting,
+        TestRunRepoPipelineCleanup,
+        TestFindPackageJsonRoot,
+        TestFindProjectRoot,
+        TestExtractFilePath,
+        TestBuildPromptContext,
     ]
 
     for cls in test_classes:
