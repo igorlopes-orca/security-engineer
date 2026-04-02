@@ -8,6 +8,7 @@ Verifies that argument parsing, filter logic, and flag enforcement
 Run with: python3 tests/test_orchestrator.py
 No API token or network access required — all tests are pure Python.
 """
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -20,13 +21,16 @@ sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import orchestrator
 from orchestrator import (main, _invoke_fix_agent, _commit_and_pr, AlertTask,
-                          FixAgentResult, _validate_flags, _print_scan_report)
+                          FixAgentResult, _validate_flags, _print_scan_report,
+                          run_one, MAX_ORCA_RETRIES)
 from run_agent import parse_filter, min_level_from_list
 from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
 from orca_cli_validator import (
     _extract_fingerprints, FindingFingerprint, orca_cli_validate,
     _SCANNER_CMD, OrcaCliResult,
 )
+from impact_agent import analyze_impact, ImpactResult
+from validator import llm_validate
 
 
 # ---------------------------------------------------------------------------
@@ -1183,6 +1187,258 @@ class TestBuildPromptContext(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Impact analysis error surfacing
+# ---------------------------------------------------------------------------
+
+class TestImpactAnalysisErrors(unittest.TestCase):
+    """Verify that analyze_impact() captures and surfaces error details."""
+
+    CASES = [
+        (
+            "timeout returns error field",
+            subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+            None,  # no CompletedProcess
+            "timeout after 90s",
+        ),
+        (
+            "non-zero exit stores stderr",
+            None,  # no exception
+            subprocess.CompletedProcess(
+                args=["claude"], returncode=1,
+                stdout="", stderr="Error: authentication failed"
+            ),
+            "exit_code=1: Error: authentication failed",
+        ),
+        (
+            "unparseable output stores snippet",
+            None,
+            subprocess.CompletedProcess(
+                args=["claude"], returncode=0,
+                stdout='{"result": "no json here at all"}', stderr=""
+            ),
+            "no_json_output:",
+        ),
+    ]
+
+    @patch("impact_agent.subprocess.run")
+    def test_error_field_populated(self, mock_run):
+        for desc, side_effect, return_value, expected_substr in self.CASES:
+            with self.subTest(desc):
+                if side_effect:
+                    mock_run.side_effect = side_effect
+                else:
+                    mock_run.side_effect = None
+                    mock_run.return_value = return_value
+                result = analyze_impact({"alert_id": "test-1"}, "diff")
+                self.assertEqual(result.level, "medium")
+                self.assertIsNotNone(result.error, f"{desc}: error should be set")
+                self.assertIn(expected_substr, result.error, f"{desc}: error detail")
+
+
+# ---------------------------------------------------------------------------
+# LLM validation error surfacing
+# ---------------------------------------------------------------------------
+
+class TestLLMValidationErrors(unittest.TestCase):
+    """Verify that llm_validate() surfaces error details in failures list."""
+
+    CASES = [
+        (
+            "timeout flags for review",
+            subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+            None,
+            "timed out",
+        ),
+        (
+            "non-zero exit includes stderr",
+            None,
+            subprocess.CompletedProcess(
+                args=["claude"], returncode=1,
+                stdout="", stderr="rate limit exceeded"
+            ),
+            "exit=1",
+        ),
+        (
+            "unparseable output includes snippet",
+            None,
+            subprocess.CompletedProcess(
+                args=["claude"], returncode=0,
+                stdout='{"result": "random text no json"}', stderr=""
+            ),
+            "Could not parse",
+        ),
+    ]
+
+    @patch("validator.subprocess.run")
+    def test_failures_populated(self, mock_run):
+        # First call is git diff, second is claude subprocess
+        git_diff_result = subprocess.CompletedProcess(
+            args=["git", "diff"], returncode=0, stdout="diff --git a/f", stderr=""
+        )
+        for desc, side_effect, return_value, expected_substr in self.CASES:
+            with self.subTest(desc):
+                if side_effect:
+                    mock_run.side_effect = [git_diff_result, side_effect]
+                else:
+                    mock_run.side_effect = [git_diff_result, return_value]
+                result = llm_validate({"alert_id": "test-1"}, Path("/tmp"))
+                self.assertTrue(result.passed, f"{desc}: should pass (flagged, not blocked)")
+                self.assertTrue(result.needs_review, f"{desc}: should flag for review")
+                self.assertTrue(
+                    any(expected_substr in f for f in result.failures),
+                    f"{desc}: expected '{expected_substr}' in failures: {result.failures}"
+                )
+
+
+# ---------------------------------------------------------------------------
+# Orca-CLI retry with feedback
+# ---------------------------------------------------------------------------
+
+class TestOrcaCliRetry(unittest.TestCase):
+    """When orca-cli detects regressions, the fix agent should be re-invoked
+    with feedback describing the new findings."""
+
+    def _make_task(self):
+        return AlertTask(
+            alert_id="orca-retry-1",
+            title="Path Traversal",
+            risk_level="high",
+            feature_type="sast",
+            source="server.js:40",
+            alert_json={"alert_id": "orca-retry-1", "feature_type": "sast"},
+        )
+
+    @patch("orchestrator._remove_worktree")
+    @patch("orchestrator.subprocess.run")
+    @patch("orchestrator._commit_and_pr", return_value="https://github.com/pr/1")
+    @patch("orchestrator.analyze_impact")
+    @patch("orchestrator._get_diff", return_value="diff --git a/server.js")
+    @patch("orchestrator.ci_gate")
+    @patch("orchestrator.orca_cli_validate")
+    @patch("orchestrator.local_build_check")
+    @patch("orchestrator.llm_validate")
+    @patch("orchestrator.sanity_check")
+    @patch("orchestrator._revert")
+    @patch("orchestrator._invoke_fix_agent")
+    @patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-test"))
+    def test_retry_on_orca_regression(
+        self, mock_wt, mock_fix, mock_revert, mock_sanity, mock_llm, mock_build,
+        mock_orca, mock_ci, mock_diff, mock_impact, mock_pr, mock_subproc, mock_rm,
+    ):
+        from validator import ValidationResult
+        from notifier import Notifier
+
+        task = self._make_task()
+        notifier = MagicMock(spec=Notifier)
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+
+        # First fix attempt succeeds
+        fix_ok = FixAgentResult(success=True, files_changed=["server.js"],
+                                diff_summary="patched path traversal")
+        # Second fix attempt also succeeds (retry)
+        fix_ok2 = FixAgentResult(success=True, files_changed=["server.js"],
+                                 diff_summary="patched with different approach")
+        mock_fix.side_effect = [fix_ok, fix_ok2]
+
+        # All basic validations pass
+        val_pass = ValidationResult(passed=True, phase="sanity")
+        mock_sanity.return_value = val_pass
+        mock_llm.return_value = val_pass
+        mock_build.return_value = val_pass
+
+        # Orca-cli: fails first time (regression), passes second time
+        orca_fail = ValidationResult(
+            passed=False, phase="orca_cli",
+            failures=["orca-cli detected 2 new finding(s): server.js:41 [abc123], server.js:46 [def456]"])
+        orca_pass = ValidationResult(passed=True, phase="orca_cli")
+        mock_orca.side_effect = [orca_fail, orca_pass]
+
+        mock_ci.return_value = ValidationResult(passed=True, phase="ci")
+        mock_impact.return_value = ImpactResult(
+            level="low", description="minor", downtime_risk=False, requires_deploy=True)
+
+        result = run_one(task, dry_run=False, notifier=notifier, repo=repo)
+
+        # Should succeed — the retry worked
+        self.assertEqual(result.state, "DONE")
+        self.assertIsNotNone(result.pr_url)
+
+        # Fix agent was called twice: first without feedback, then with
+        self.assertEqual(mock_fix.call_count, 2)
+        second_call_kwargs = mock_fix.call_args_list[1]
+        self.assertIn("feedback", second_call_kwargs.kwargs)
+        self.assertIn("orca-cli detected", second_call_kwargs.kwargs["feedback"])
+
+    @patch("orchestrator._remove_worktree")
+    @patch("orchestrator.orca_cli_validate")
+    @patch("orchestrator.local_build_check")
+    @patch("orchestrator.llm_validate")
+    @patch("orchestrator.sanity_check")
+    @patch("orchestrator._revert")
+    @patch("orchestrator._invoke_fix_agent")
+    @patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-test"))
+    def test_exhausted_retries_fails(
+        self, mock_wt, mock_fix, mock_revert, mock_sanity, mock_llm, mock_build,
+        mock_orca, mock_rm,
+    ):
+        from validator import ValidationResult
+        from notifier import Notifier
+
+        task = self._make_task()
+        notifier = MagicMock(spec=Notifier)
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+
+        fix_ok = FixAgentResult(success=True, files_changed=["server.js"],
+                                diff_summary="patched")
+        mock_fix.return_value = fix_ok
+
+        val_pass = ValidationResult(passed=True, phase="sanity")
+        mock_sanity.return_value = val_pass
+        mock_llm.return_value = val_pass
+        mock_build.return_value = val_pass
+
+        # Orca-cli always fails
+        orca_fail = ValidationResult(
+            passed=False, phase="orca_cli",
+            failures=["orca-cli detected 1 new finding(s): server.js:41 [abc123]"])
+        mock_orca.return_value = orca_fail
+
+        result = run_one(task, dry_run=False, notifier=notifier, repo=repo)
+
+        self.assertEqual(result.state, "FAILED")
+        self.assertIn("orca-cli detected", result.failure_reason)
+        # Called initial + MAX_ORCA_RETRIES times
+        self.assertEqual(mock_fix.call_count, 1 + MAX_ORCA_RETRIES)
+
+
+    CASES = [
+        (
+            "feedback appended to prompt",
+            "orca-cli detected 3 new findings: file.js:10 [aaa], file.js:20 [bbb]",
+            "Previous Attempt Failed",
+        ),
+    ]
+
+    @patch("orchestrator.subprocess.run")
+    def test_feedback_in_prompt(self, mock_run):
+        """Verify that feedback text appears in the claude subprocess prompt."""
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["claude"], returncode=0,
+            stdout='{"result": "{\\"status\\": \\"success\\", \\"alert_id\\": \\"t\\", \\"files_changed\\": [], \\"diff_summary\\": \\"ok\\"}"}',
+            stderr=""
+        )
+        task = self._make_task()
+        task.worktree_path = Path("/tmp/test")
+        feedback = "orca-cli detected 2 new finding(s): server.js:41, server.js:46"
+
+        _invoke_fix_agent(task, dry_run=False, timeout_sec=60, feedback=feedback)
+
+        prompt_arg = mock_run.call_args[0][0][2]  # cmd[2] is the prompt
+        self.assertIn("Previous Attempt Failed", prompt_arg)
+        self.assertIn(feedback, prompt_arg)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1213,6 +1469,9 @@ if __name__ == "__main__":
         TestFindProjectRoot,
         TestExtractFilePath,
         TestBuildPromptContext,
+        TestImpactAnalysisErrors,
+        TestLLMValidationErrors,
+        TestOrcaCliRetry,
     ]
 
     for cls in test_classes:

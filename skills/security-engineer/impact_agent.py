@@ -79,19 +79,22 @@ def analyze_impact(
             cmd, capture_output=True, text=True, timeout=timeout_sec
         )
     except subprocess.TimeoutExpired:
+        print(f"[WARN] impact analysis timed out after {timeout_sec}s")
         return ImpactResult(
             level="medium",
             description="Impact analysis timed out — treating as medium risk",
             downtime_risk=False, requires_deploy=True,
-            error="timeout",
+            error=f"timeout after {timeout_sec}s",
         )
 
     if result.returncode != 0:
+        stderr = result.stderr[:500]
+        print(f"[WARN] impact analysis failed (exit={result.returncode}): {stderr}")
         return ImpactResult(
             level="medium",
             description="Impact analysis failed — treating as medium risk",
             downtime_risk=False, requires_deploy=True,
-            error=result.stderr[:300],
+            error=f"exit_code={result.returncode}: {stderr}",
         )
 
     return _parse(result.stdout)
@@ -106,11 +109,13 @@ def _parse(raw: str) -> ImpactResult:
 
     data = find_last_json_with_key(text, "level")
     if not data:
+        snippet = text[:200] if text else "(empty)"
+        print(f"[WARN] could not parse impact analysis output: {snippet}")
         return ImpactResult(
             level="medium",
             description="Could not parse impact analysis — treating as medium risk",
             downtime_risk=False, requires_deploy=True,
-            error="no_json_output",
+            error=f"no_json_output: {snippet}",
         )
 
     return ImpactResult(

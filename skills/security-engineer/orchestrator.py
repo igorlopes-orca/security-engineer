@@ -40,6 +40,7 @@ _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
 MAX_WORKERS = 4
 REPO_WORKERS = 3    # concurrent repos in --all-repos mode (total agents = REPO_WORKERS × MAX_WORKERS)
 MAX_RETRIES = 2
+MAX_ORCA_RETRIES = 1   # re-invoke fix agent once with orca-cli feedback
 RETRYABLE_ERRORS = {"json_parse_failure", "subprocess_error"}
 TIMEOUTS = {"sast": 180, "iac": 120, "secret": 120, "cve": 240}
 
@@ -244,7 +245,8 @@ def _build_prompt_context(alert: dict) -> dict:
     }
 
 
-def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int) -> FixAgentResult:
+def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
+                      feedback: str | None = None) -> FixAgentResult:
     instructions_path = _THIS_DIR / "fix-agents" / f"{task.feature_type}.md"
     if not instructions_path.exists():
         return FixAgentResult(
@@ -271,6 +273,17 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int) -> FixAg
         feature_type=task.feature_type,
         **ctx,
     )
+
+    if feedback:
+        prompt += (
+            "\n\n## Previous Attempt Failed\n\n"
+            "Your previous fix introduced new security findings detected by orca-cli:\n"
+            f"{feedback}\n\n"
+            "Revert your approach and try a different fix strategy that does not "
+            "introduce these issues.\n"
+            "Do NOT repeat the same fix. Read the file again and find an "
+            "alternative approach."
+        )
 
     cmd = [
         "claude", "-p", prompt,
@@ -407,6 +420,7 @@ def _notify_payload(task: AlertTask) -> NotificationPayload:
         impact_level=task.impact.level if task.impact else None,
         manual_steps=task.impact.manual_steps if task.impact else [],
         concerns=task.impact.concerns if task.impact else [],
+        error_detail=task.impact.error if task.impact else None,
     )
 
 
@@ -483,53 +497,89 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
-    # Phase 1: sanity
-    task.state = "VALIDATE_LOCAL"
-    sanity = sanity_check(task.alert_json, task.worktree_path)
-    if not sanity.passed:
-        task.state = "FAILED"
-        task.failure_reason = "; ".join(sanity.failures)
-        p = _notify_payload(task)
-        p.repo = repo.name
-        notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
-        return task
+    # Validation phases 1-3b with orca-cli retry loop
+    orca_feedback: str | None = None
+    timeout = TIMEOUTS.get(task.feature_type, 180)
 
-    # Phase 2: LLM validation
-    llm_val = llm_validate(task.alert_json, task.worktree_path)
-    if not llm_val.passed:
-        task.state = "FAILED"
-        task.failure_reason = "; ".join(llm_val.failures)
-        p = _notify_payload(task)
-        p.repo = repo.name
-        notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
-        return task
-    if llm_val.needs_review:
-        task.needs_review = True
+    for orca_attempt in range(MAX_ORCA_RETRIES + 1):
+        # On retry: revert the bad fix and re-invoke agent with feedback
+        if orca_attempt > 0:
+            print(f"[RETRY] {task.alert_id} orca-cli found regressions, "
+                  f"retrying fix (attempt {orca_attempt + 1})")
+            _revert(task.worktree_path)
+            fix_result = _invoke_fix_agent(task, dry_run, timeout,
+                                           feedback=orca_feedback)
+            if not fix_result.success:
+                task.state = "FAILED"
+                task.failure_reason = fix_result.failure_reason
+                p = _notify_payload(task)
+                p.repo = repo.name
+                notifier.notify("fix_failed", p)
+                _remove_worktree(task.worktree_path, branch, repo=repo)
+                return task
+            task.fix_result = fix_result
 
-    # Phase 3: local build
-    local_val = local_build_check(
-        fix_result.files_changed, task.worktree_path,
-        source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
-    )
-    if not local_val.passed:
-        task.state = "FAILED"
-        task.failure_reason = "; ".join(local_val.failures)
-        p = _notify_payload(task)
-        p.repo = repo.name
-        notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
-        return task
+        # Phase 1: sanity
+        task.state = "VALIDATE_LOCAL"
+        print(f"[PHASE] {task.alert_id} sanity check", flush=True)
+        sanity = sanity_check(task.alert_json, task.worktree_path)
+        if not sanity.passed:
+            task.state = "FAILED"
+            task.failure_reason = "; ".join(sanity.failures)
+            p = _notify_payload(task)
+            p.repo = repo.name
+            notifier.notify("validation_failed", p)
+            _revert(task.worktree_path)
+            _remove_worktree(task.worktree_path, branch, repo=repo)
+            return task
 
-    # Phase 3b: orca-cli validation (before/after scan)
-    task.state = "VALIDATE_ORCA_CLI"
-    orca_val = orca_cli_validate(
-        task.alert_json, task.worktree_path, task.feature_type)
-    if not orca_val.passed:
+        # Phase 2: LLM validation
+        print(f"[PHASE] {task.alert_id} LLM validation", flush=True)
+        llm_val = llm_validate(task.alert_json, task.worktree_path)
+        if not llm_val.passed:
+            task.state = "FAILED"
+            task.failure_reason = "; ".join(llm_val.failures)
+            p = _notify_payload(task)
+            p.repo = repo.name
+            notifier.notify("validation_failed", p)
+            _revert(task.worktree_path)
+            _remove_worktree(task.worktree_path, branch, repo=repo)
+            return task
+        if llm_val.needs_review:
+            task.needs_review = True
+
+        # Phase 3: local build
+        print(f"[PHASE] {task.alert_id} local build check", flush=True)
+        local_val = local_build_check(
+            fix_result.files_changed, task.worktree_path,
+            source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
+        )
+        if not local_val.passed:
+            task.state = "FAILED"
+            task.failure_reason = "; ".join(local_val.failures)
+            p = _notify_payload(task)
+            p.repo = repo.name
+            notifier.notify("validation_failed", p)
+            _revert(task.worktree_path)
+            _remove_worktree(task.worktree_path, branch, repo=repo)
+            return task
+
+        # Phase 3b: orca-cli validation (before/after scan)
+        task.state = "VALIDATE_ORCA_CLI"
+        print(f"[PHASE] {task.alert_id} orca-cli before/after scan", flush=True)
+        orca_val = orca_cli_validate(
+            task.alert_json, task.worktree_path, task.feature_type)
+        if orca_val.passed:
+            if orca_val.needs_review:
+                task.needs_review = True
+            break  # all validations passed
+
+        # Orca-cli failed — retry or give up
+        if orca_attempt < MAX_ORCA_RETRIES:
+            orca_feedback = "; ".join(orca_val.failures)
+            continue
+
+        # Final attempt exhausted
         task.state = "FAILED"
         task.failure_reason = "; ".join(orca_val.failures)
         p = _notify_payload(task)
@@ -538,16 +588,18 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         _revert(task.worktree_path)
         _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
-    if orca_val.needs_review:
-        task.needs_review = True
 
     # Impact analysis
     task.state = "IMPACT_ANALYSIS"
+    print(f"[PHASE] {task.alert_id} production impact analysis", flush=True)
     diff_text = _get_diff(task.worktree_path)
     task.impact = analyze_impact(task.alert_json, diff_text)
+    if task.impact.error:
+        print(f"[WARN] {task.alert_id} impact analysis error: {task.impact.error}")
 
     # Commit + PR
     task.state = "COMMITTING"
+    print(f"[PHASE] {task.alert_id} commit + open PR", flush=True)
     try:
         pr_url = _commit_and_pr(task, task.impact, dry_run)
     except RuntimeError as e:
@@ -574,15 +626,18 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
 
     # Phase 4: CI gate
     if pr_url:
+        print(f"[PHASE] {task.alert_id} waiting for CI checks", flush=True)
         task.state = "VALIDATE_CI"
         ci = ci_gate(pr_url, timeout_sec=600)
         if not ci.passed:
             task.state = "CI_FAILED"
             task.failure_reason = "; ".join(ci.failures)
-            subprocess.run(
+            r = subprocess.run(
                 ["gh", "pr", "edit", pr_url, "--add-label", "ci-failed"],
-                capture_output=True
+                capture_output=True, text=True
             )
+            if r.returncode != 0:
+                print(f"[WARN] failed to add ci-failed label: {r.stderr[:200]}")
             p = _notify_payload(task)
             p.repo = repo.name
             notifier.notify("ci_failed", p)
@@ -593,17 +648,21 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
 
     # Add needs-review label
     if task.needs_review and pr_url:
-        subprocess.run(
+        r = subprocess.run(
             ["gh", "pr", "edit", pr_url, "--add-label", "needs-review"],
-            capture_output=True
+            capture_output=True, text=True
         )
+        if r.returncode != 0:
+            print(f"[WARN] failed to add needs-review label: {r.stderr[:200]}")
 
     # Add impact label
     if task.impact and pr_url:
-        subprocess.run(
+        r = subprocess.run(
             ["gh", "pr", "edit", pr_url, "--add-label", f"impact:{task.impact.level}"],
-            capture_output=True
+            capture_output=True, text=True
         )
+        if r.returncode != 0:
+            print(f"[WARN] failed to add impact label: {r.stderr[:200]}")
 
     p = _notify_payload(task)
     p.repo = repo.name
@@ -880,7 +939,7 @@ def _run_repo_pipeline(repo: Repository, args) -> dict:
 
     Returns a dict with keys: results, skipped, scm_posture, unfixable, error.
     """
-    notifier = build_notifiers(repo.name, _THIS_DIR)
+    notifier = build_notifiers(repo.name, Path.cwd())
 
     p = _repo_notif(repo)
     notifier.notify("clone_started", p)
@@ -1055,7 +1114,7 @@ def main(argv=None):
         sys.exit("Error: could not detect repo from git remote. "
                  "Run from inside a git repo or use --remote owner/repo.")
 
-    notifier = build_notifiers(repo.name, _THIS_DIR)
+    notifier = build_notifiers(repo.name, Path.cwd())
 
     if args.dry_run:
         print("Mode: DRY-RUN — fix agents will read files and plan fixes, cannot edit.")

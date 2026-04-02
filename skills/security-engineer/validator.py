@@ -117,13 +117,15 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
     except subprocess.TimeoutExpired:
-        # Don't block on timeout — flag for review instead
+        print(f"[WARN] LLM validation timed out after {timeout_sec}s")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
                                 failures=["LLM validation timed out — flagged for human review"])
 
     if result.returncode != 0:
+        stderr = result.stderr[:500] if result.stderr else "(no stderr)"
+        print(f"[WARN] LLM validation failed (exit={result.returncode}): {stderr}")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=["LLM validation errored — flagged for human review"])
+                                failures=[f"LLM validation errored (exit={result.returncode}): {stderr}"])
 
     return _parse_llm(result.stdout)
 
@@ -137,8 +139,10 @@ def _parse_llm(raw: str) -> ValidationResult:
 
     data = find_last_json_with_key(text, "verdict")
     if not data:
+        snippet = text[:200] if text else "(empty)"
+        print(f"[WARN] could not parse LLM validation output: {snippet}")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=["Could not parse LLM validation response"])
+                                failures=[f"Could not parse LLM validation response: {snippet}"])
 
     verdict = data.get("verdict", "uncertain")
     reason = data.get("reason", "")
