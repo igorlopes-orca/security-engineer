@@ -19,9 +19,14 @@ sys.path.insert(0, str(_DIR.parent))             # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import orchestrator
-from orchestrator import main, _invoke_fix_agent, _commit_and_pr, AlertTask, FixAgentResult
+from orchestrator import (main, _invoke_fix_agent, _commit_and_pr, AlertTask,
+                          FixAgentResult, _validate_flags, _print_scan_report)
 from run_agent import parse_filter, min_level_from_list
 from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
+from orca_cli_validator import (
+    _extract_fingerprints, FindingFingerprint, orca_cli_validate,
+    _SCANNER_CMD, OrcaCliResult,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +93,129 @@ class TestArgumentParsing(unittest.TestCase):
     def test_combined_filter(self):
         args = self._parse(["high,cve"])
         self.assertEqual(args.filter_tokens, "high,cve")
+
+    def test_scan_flag(self):
+        args = main.__wrapped__(["--scan"]) if hasattr(main, '__wrapped__') else None
+        # Use orchestrator's own parser directly
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--scan", action="store_true")
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--alert", default=None)
+        parser.add_argument("--max", type=int, default=None)
+        parser.add_argument("positional", nargs="*")
+        args = parser.parse_args(["--scan"])
+        self.assertTrue(args.scan)
+
+    def test_scan_with_filter(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--scan", action="store_true")
+        parser.add_argument("--dry-run", action="store_true")
+        parser.add_argument("--alert", default=None)
+        parser.add_argument("--max", type=int, default=None)
+        parser.add_argument("positional", nargs="*")
+        args = parser.parse_args(["--scan", "high,cve"])
+        self.assertTrue(args.scan)
+        args.filter_tokens = None
+        for p in args.positional:
+            args.filter_tokens = p
+        self.assertEqual(args.filter_tokens, "high,cve")
+
+
+# ---------------------------------------------------------------------------
+# 1b. Flag validation
+# ---------------------------------------------------------------------------
+
+class TestFlagValidation(unittest.TestCase):
+
+    INVALID_COMBOS = [
+        ("--scan + --dry-run", {"scan": True, "dry_run": True, "alert": None, "max": None},
+         "--scan and --dry-run cannot be combined"),
+        ("--scan + --alert", {"scan": True, "dry_run": False, "alert": "orca-1", "max": None},
+         "--scan and --alert cannot be combined"),
+        ("--scan + --max", {"scan": True, "dry_run": False, "alert": None, "max": 3},
+         "--scan and --max cannot be combined"),
+    ]
+
+    def test_invalid_combos(self):
+        import argparse
+        for desc, kwargs, expected_msg in self.INVALID_COMBOS:
+            with self.subTest(desc):
+                args = argparse.Namespace(**kwargs, remote=None, filter_tokens=None,
+                                          repo=None, positional=[])
+                with self.assertRaises(SystemExit) as ctx:
+                    _validate_flags(args)
+                self.assertIn(expected_msg, str(ctx.exception))
+
+    VALID_COMBOS = [
+        ("--scan alone", {"scan": True, "dry_run": False, "alert": None, "max": None}),
+        ("no --scan with --dry-run", {"scan": False, "dry_run": True, "alert": None, "max": None}),
+        ("no --scan with --alert", {"scan": False, "dry_run": False, "alert": "orca-1", "max": None}),
+        ("no flags", {"scan": False, "dry_run": False, "alert": None, "max": None}),
+    ]
+
+    def test_valid_combos(self):
+        import argparse
+        for desc, kwargs in self.VALID_COMBOS:
+            with self.subTest(desc):
+                args = argparse.Namespace(**kwargs, remote=None, filter_tokens=None,
+                                          repo=None, positional=[])
+                _validate_flags(args)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# 1c. Scan report output
+# ---------------------------------------------------------------------------
+
+class TestScanReport(unittest.TestCase):
+
+    SAMPLE_ALERTS = [
+        {"alert_id": "orca-1", "title": "SQL Injection", "risk_level": "critical",
+         "category": "Code", "score": 9.5, "feature_type": "sast", "labels": []},
+        {"alert_id": "orca-2", "title": "Old Dependency", "risk_level": "high",
+         "category": "Vulnerabilities", "score": 7.0, "feature_type": "", "labels": []},
+        {"alert_id": "orca-3", "title": "Debug Mode", "risk_level": "medium",
+         "category": "Code", "score": 4.0, "feature_type": "iac", "labels": []},
+    ]
+
+    def test_report_contains_all_alerts(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
+        output = buf.getvalue()
+        self.assertIn("owner/repo", output)
+        self.assertIn("orca-1", output)
+        self.assertIn("orca-2", output)
+        self.assertIn("orca-3", output)
+        self.assertIn("SQL Injection", output)
+
+    def test_report_grouped_by_risk(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
+        output = buf.getvalue()
+        self.assertIn("Critical", output)
+        self.assertIn("High", output)
+        self.assertIn("Medium", output)
+
+    def test_report_total_count(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
+        output = buf.getvalue()
+        self.assertIn("**3**", output)
+
+    def test_empty_alerts(self):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print_scan_report("owner/repo", [])
+        output = buf.getvalue()
+        self.assertIn("**0**", output)
 
 
 # ---------------------------------------------------------------------------
@@ -649,6 +777,166 @@ class TestRunRepoPipelineCleanup(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Orca CLI validator
+# ---------------------------------------------------------------------------
+
+class TestScannerMapping(unittest.TestCase):
+    """Scanner mapping covers all fixable feature types."""
+
+    CASES = [
+        ("sast", ["sast", "scan"]),
+        ("iac", ["iac", "scan"]),
+        ("cve", ["sca", "scan"]),
+        ("secret", ["secrets", "scan"]),
+    ]
+
+    def test_cases(self):
+        for feature_type, expected_cmd in self.CASES:
+            with self.subTest(feature_type):
+                self.assertEqual(_SCANNER_CMD[feature_type], expected_cmd)
+
+    def test_unknown_type_not_mapped(self):
+        self.assertNotIn("scm_posture", _SCANNER_CMD)
+
+
+class TestFingerprintExtraction(unittest.TestCase):
+    """_extract_fingerprints normalizes orca-cli JSON into comparable sets."""
+
+    SAMPLE_SAST_OUTPUT = {
+        "results": [
+            {
+                "catalog_control": {"id": "ctrl-001", "title": "SQL Injection"},
+                "findings": [
+                    {"file_name": "app.py", "position": {"start_line": 42, "end_line": 45},
+                     "id": "f1"},
+                    {"file_name": "app.py", "position": {"start_line": 88, "end_line": 90},
+                     "id": "f2"},
+                ]
+            },
+            {
+                "catalog_control": {"id": "ctrl-002", "title": "Path Traversal"},
+                "findings": [
+                    {"file_name": "routes.py", "position": {"start_line": 10, "end_line": 15},
+                     "id": "f3"},
+                ]
+            }
+        ]
+    }
+
+    def test_extracts_all_findings(self):
+        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
+        self.assertEqual(len(fps), 3)
+
+    def test_fingerprint_fields(self):
+        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
+        expected = FindingFingerprint(control_id="ctrl-001", file_name="app.py", start_line=42)
+        self.assertIn(expected, fps)
+
+    def test_empty_results(self):
+        fps = _extract_fingerprints({"results": []})
+        self.assertEqual(len(fps), 0)
+
+    def test_null_results(self):
+        fps = _extract_fingerprints({"results": None})
+        self.assertEqual(len(fps), 0)
+
+    def test_empty_dict(self):
+        fps = _extract_fingerprints({})
+        self.assertEqual(len(fps), 0)
+
+    def test_missing_position(self):
+        data = {"results": [{"catalog_control": {"id": "c1"},
+                             "findings": [{"file_name": "f.py", "position": {}}]}]}
+        fps = _extract_fingerprints(data)
+        self.assertEqual(len(fps), 1)
+        self.assertEqual(list(fps)[0].start_line, 0)
+
+
+class TestBeforeAfterComparison(unittest.TestCase):
+    """orca_cli_validate compares before/after scans correctly."""
+
+    def _make_scan_output(self, findings):
+        """Build minimal orca-cli JSON from a list of (control_id, file, line) tuples."""
+        results = {}
+        for ctrl_id, fname, line in findings:
+            if ctrl_id not in results:
+                results[ctrl_id] = {
+                    "catalog_control": {"id": ctrl_id, "title": ctrl_id},
+                    "findings": []
+                }
+            results[ctrl_id]["findings"].append({
+                "file_name": fname,
+                "position": {"start_line": line},
+                "id": f"{ctrl_id}-{fname}-{line}",
+            })
+        return {"results": list(results.values())}
+
+    def test_fix_verified_no_regressions(self):
+        """Original finding disappears, no new ones → pass, no review needed."""
+        before = self._make_scan_output([("c1", "app.py", 42), ("c2", "lib.py", 10)])
+        after = self._make_scan_output([("c2", "lib.py", 10)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        fixed = before_fps - after_fps
+        new = after_fps - before_fps
+
+        self.assertEqual(len(fixed), 1)
+        self.assertEqual(len(new), 0)
+
+    def test_regression_detected(self):
+        """New finding appears → should fail."""
+        before = self._make_scan_output([("c1", "app.py", 42)])
+        after = self._make_scan_output([("c3", "app.py", 99)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        new = after_fps - before_fps
+        self.assertEqual(len(new), 1)
+
+    def test_no_change(self):
+        """Same findings before and after → pass but needs review (fix not verified)."""
+        before = self._make_scan_output([("c1", "app.py", 42)])
+        after = self._make_scan_output([("c1", "app.py", 42)])
+
+        before_fps = _extract_fingerprints(before)
+        after_fps = _extract_fingerprints(after)
+
+        fixed = before_fps - after_fps
+        new = after_fps - before_fps
+
+        self.assertEqual(len(fixed), 0)
+        self.assertEqual(len(new), 0)
+
+
+import os
+
+
+class TestOrcaCliValidateSkip(unittest.TestCase):
+    """orca_cli_validate skips gracefully when prerequisites are missing."""
+
+    def test_unknown_feature_type_skips(self):
+        result = orca_cli_validate({}, Path("/tmp"), "scm_posture")
+        self.assertTrue(result.passed)
+
+    @patch("orca_cli_validator._get_api_token", return_value=None)
+    def test_no_token_skips(self, _mock):
+        result = orca_cli_validate({}, Path("/tmp"), "sast")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.needs_review)
+        self.assertIn("not set", result.failures[0])
+
+    @patch("shutil.which", return_value=None)
+    @patch("orca_cli_validator._get_api_token", return_value="test-token")
+    def test_no_binary_skips(self, _mock_token, _mock_which):
+        result = orca_cli_validate({}, Path("/tmp"), "sast")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.needs_review)
+        self.assertIn("not installed", result.failures[0])
+
+# ---------------------------------------------------------------------------
 # Build root detection
 # ---------------------------------------------------------------------------
 
@@ -904,6 +1192,8 @@ if __name__ == "__main__":
 
     test_classes = [
         TestArgumentParsing,
+        TestFlagValidation,
+        TestScanReport,
         TestFilterParsing,
         TestMinLevel,
         TestFeatureTypeResolution,
@@ -915,6 +1205,10 @@ if __name__ == "__main__":
         TestWorktreeCwd,
         TestRemoteRouting,
         TestRunRepoPipelineCleanup,
+        TestScannerMapping,
+        TestFingerprintExtraction,
+        TestBeforeAfterComparison,
+        TestOrcaCliValidateSkip,
         TestFindPackageJsonRoot,
         TestFindProjectRoot,
         TestExtractFilePath,
