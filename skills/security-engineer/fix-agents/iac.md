@@ -128,3 +128,22 @@ volumes:
     emptyDir: {}
 ```
 
+---
+
+## Handling Orca Check Feedback
+
+If the orchestrator re-invokes you with feedback from the Orca security check, it means your fix introduced **new** IaC misconfigurations on the PR.
+
+**Common causes:**
+- Your fix relaxed permissions or opened ports elsewhere in the manifest
+- You removed encryption settings, resource limits, or network policies as a side effect
+- You added a `securityContext` but missed other required fields (e.g., `readOnlyRootFilesystem`)
+- Your Dockerfile changes introduced a new misconfiguration (e.g., running as root in a different stage)
+
+**How to respond:**
+1. Read the finding's file and line from the feedback
+2. Verify your fix didn't relax security posture in adjacent configuration blocks
+3. Ensure all security-relevant fields are preserved or strengthened, not just the one being fixed
+4. For Kubernetes manifests, check both pod-level and container-level security contexts
+5. For Dockerfiles with multi-stage builds, ensure all stages follow security best practices
+

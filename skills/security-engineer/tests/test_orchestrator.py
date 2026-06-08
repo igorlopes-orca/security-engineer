@@ -22,15 +22,13 @@ sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 import orchestrator
 from orchestrator import (main, _invoke_fix_agent, _commit_and_pr, AlertTask,
                           FixAgentResult, _validate_flags, _print_scan_report,
-                          run_one, MAX_ORCA_RETRIES)
+                          run_one)
 from run_agent import parse_filter, min_level_from_list
 from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
-from orca_cli_validator import (
-    _extract_fingerprints, FindingFingerprint, orca_cli_validate,
-    _SCANNER_CMD, OrcaCliResult,
-)
+from config import load_config, Config, OrcaCheckConfig
 from impact_agent import analyze_impact, ImpactResult
-from validator import llm_validate
+from validator import (llm_validate, orca_check_gate, _parse_pr_url,
+                       OrcaCheckFinding, ValidationResult)
 
 
 # ---------------------------------------------------------------------------
@@ -781,164 +779,95 @@ class TestRunRepoPipelineCleanup(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Orca CLI validator
+# Orca GitHub App check gate
 # ---------------------------------------------------------------------------
 
-class TestScannerMapping(unittest.TestCase):
-    """Scanner mapping covers all fixable feature types."""
+class TestOrcaCheckGate(unittest.TestCase):
+    """Table-driven tests for orca_check_gate and helpers."""
 
-    CASES = [
-        ("sast", ["sast", "scan"]),
-        ("iac", ["iac", "scan"]),
-        ("cve", ["sca", "scan"]),
-        ("secret", ["secrets", "scan"]),
-    ]
-
-    def test_cases(self):
-        for feature_type, expected_cmd in self.CASES:
-            with self.subTest(feature_type):
-                self.assertEqual(_SCANNER_CMD[feature_type], expected_cmd)
-
-    def test_unknown_type_not_mapped(self):
-        self.assertNotIn("scm_posture", _SCANNER_CMD)
-
-
-class TestFingerprintExtraction(unittest.TestCase):
-    """_extract_fingerprints normalizes orca-cli JSON into comparable sets."""
-
-    SAMPLE_SAST_OUTPUT = {
-        "results": [
-            {
-                "catalog_control": {"id": "ctrl-001", "title": "SQL Injection"},
-                "findings": [
-                    {"file_name": "app.py", "position": {"start_line": 42, "end_line": 45},
-                     "id": "f1"},
-                    {"file_name": "app.py", "position": {"start_line": 88, "end_line": 90},
-                     "id": "f2"},
-                ]
-            },
-            {
-                "catalog_control": {"id": "ctrl-002", "title": "Path Traversal"},
-                "findings": [
-                    {"file_name": "routes.py", "position": {"start_line": 10, "end_line": 15},
-                     "id": "f3"},
-                ]
-            }
+    def test_parse_pr_url(self):
+        CASES = [
+            ("standard PR URL", "https://github.com/owner/repo/pull/42",
+             ("owner/repo", 42)),
+            ("PR URL with path", "https://github.com/org/my-repo/pull/123",
+             ("org/my-repo", 123)),
         ]
-    }
+        for desc, url, expected in CASES:
+            with self.subTest(desc):
+                self.assertEqual(_parse_pr_url(url), expected)
 
-    def test_extracts_all_findings(self):
-        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
-        self.assertEqual(len(fps), 3)
+    def test_parse_pr_url_invalid(self):
+        CASES = [
+            ("not a PR URL", "https://github.com/owner/repo/issues/1"),
+            ("not github", "https://gitlab.com/owner/repo/pull/1"),
+            ("empty", ""),
+        ]
+        for desc, url in CASES:
+            with self.subTest(desc):
+                with self.assertRaises(ValueError):
+                    _parse_pr_url(url)
 
-    def test_fingerprint_fields(self):
-        fps = _extract_fingerprints(self.SAMPLE_SAST_OUTPUT)
-        expected = FindingFingerprint(control_id="ctrl-001", file_name="app.py", start_line=42)
-        self.assertIn(expected, fps)
-
-    def test_empty_results(self):
-        fps = _extract_fingerprints({"results": []})
-        self.assertEqual(len(fps), 0)
-
-    def test_null_results(self):
-        fps = _extract_fingerprints({"results": None})
-        self.assertEqual(len(fps), 0)
-
-    def test_empty_dict(self):
-        fps = _extract_fingerprints({})
-        self.assertEqual(len(fps), 0)
-
-    def test_missing_position(self):
-        data = {"results": [{"catalog_control": {"id": "c1"},
-                             "findings": [{"file_name": "f.py", "position": {}}]}]}
-        fps = _extract_fingerprints(data)
-        self.assertEqual(len(fps), 1)
-        self.assertEqual(list(fps)[0].start_line, 0)
-
-
-class TestBeforeAfterComparison(unittest.TestCase):
-    """orca_cli_validate compares before/after scans correctly."""
-
-    def _make_scan_output(self, findings):
-        """Build minimal orca-cli JSON from a list of (control_id, file, line) tuples."""
-        results = {}
-        for ctrl_id, fname, line in findings:
-            if ctrl_id not in results:
-                results[ctrl_id] = {
-                    "catalog_control": {"id": ctrl_id, "title": ctrl_id},
-                    "findings": []
-                }
-            results[ctrl_id]["findings"].append({
-                "file_name": fname,
-                "position": {"start_line": line},
-                "id": f"{ctrl_id}-{fname}-{line}",
-            })
-        return {"results": list(results.values())}
-
-    def test_fix_verified_no_regressions(self):
-        """Original finding disappears, no new ones → pass, no review needed."""
-        before = self._make_scan_output([("c1", "app.py", 42), ("c2", "lib.py", 10)])
-        after = self._make_scan_output([("c2", "lib.py", 10)])
-
-        before_fps = _extract_fingerprints(before)
-        after_fps = _extract_fingerprints(after)
-
-        fixed = before_fps - after_fps
-        new = after_fps - before_fps
-
-        self.assertEqual(len(fixed), 1)
-        self.assertEqual(len(new), 0)
-
-    def test_regression_detected(self):
-        """New finding appears → should fail."""
-        before = self._make_scan_output([("c1", "app.py", 42)])
-        after = self._make_scan_output([("c3", "app.py", 99)])
-
-        before_fps = _extract_fingerprints(before)
-        after_fps = _extract_fingerprints(after)
-
-        new = after_fps - before_fps
-        self.assertEqual(len(new), 1)
-
-    def test_no_change(self):
-        """Same findings before and after → pass but needs review (fix not verified)."""
-        before = self._make_scan_output([("c1", "app.py", 42)])
-        after = self._make_scan_output([("c1", "app.py", 42)])
-
-        before_fps = _extract_fingerprints(before)
-        after_fps = _extract_fingerprints(after)
-
-        fixed = before_fps - after_fps
-        new = after_fps - before_fps
-
-        self.assertEqual(len(fixed), 0)
-        self.assertEqual(len(new), 0)
-
-
-import os
-
-
-class TestOrcaCliValidateSkip(unittest.TestCase):
-    """orca_cli_validate skips gracefully when prerequisites are missing."""
-
-    def test_unknown_feature_type_skips(self):
-        result = orca_cli_validate({}, Path("/tmp"), "scm_posture")
+    @patch("validator.time.monotonic")
+    @patch("validator._find_orca_check_run")
+    @patch("validator._get_pr_head_sha", return_value="abc123def")
+    def test_check_passes(self, mock_sha, mock_find, mock_time):
+        """Orca check completed with success → passed=True."""
+        mock_time.side_effect = [0, 0, 1]  # deadline, grace_deadline, loop check
+        mock_find.return_value = {
+            "id": 1, "status": "completed", "conclusion": "success", "name": "orca-security-us",
+        }
+        result = orca_check_gate("https://github.com/owner/repo/pull/1")
         self.assertTrue(result.passed)
+        self.assertFalse(result.needs_review)
 
-    @patch("orca_cli_validator._get_api_token", return_value=None)
-    def test_no_token_skips(self, _mock):
-        result = orca_cli_validate({}, Path("/tmp"), "sast")
+    @patch("validator.time.monotonic")
+    @patch("validator._get_check_annotations")
+    @patch("validator._find_orca_check_run")
+    @patch("validator._get_pr_head_sha", return_value="abc123def")
+    def test_check_fails_with_annotations(self, mock_sha, mock_find, mock_ann, mock_time):
+        """Orca check completed with failure → passed=False, failures populated."""
+        mock_time.side_effect = [0, 0, 1]
+        mock_find.return_value = {
+            "id": 42, "status": "completed", "conclusion": "failure", "name": "orca-security-us",
+        }
+        mock_ann.return_value = [
+            OrcaCheckFinding(file="app.py", line=10, message="SQL injection", severity="failure"),
+        ]
+        result = orca_check_gate("https://github.com/owner/repo/pull/1")
+        self.assertFalse(result.passed)
+        self.assertEqual(len(result.failures), 1)
+        self.assertIn("app.py:10", result.failures[0])
+        self.assertIn("SQL injection", result.failures[0])
+
+    @patch("validator.time.monotonic")
+    @patch("validator._find_orca_check_run")
+    @patch("validator._get_pr_head_sha", return_value="abc123def")
+    def test_check_not_found_skips(self, mock_sha, mock_find, mock_time):
+        """Check never appears after grace period → passed=True, needs_review=True."""
+        # First call: deadline (far future), second: grace_deadline (past)
+        # Loop iterations: always past grace
+        mock_time.side_effect = [0, 0, 31, 31]
+        mock_find.return_value = None
+        result = orca_check_gate("https://github.com/owner/repo/pull/1")
         self.assertTrue(result.passed)
         self.assertTrue(result.needs_review)
-        self.assertIn("not set", result.failures[0])
 
-    @patch("shutil.which", return_value=None)
-    @patch("orca_cli_validator._get_api_token", return_value="test-token")
-    def test_no_binary_skips(self, _mock_token, _mock_which):
-        result = orca_cli_validate({}, Path("/tmp"), "sast")
-        self.assertTrue(result.passed)
-        self.assertTrue(result.needs_review)
-        self.assertIn("not installed", result.failures[0])
+    @patch("validator.time.sleep")
+    @patch("validator.time.monotonic")
+    @patch("validator._find_orca_check_run")
+    @patch("validator._get_pr_head_sha", return_value="abc123def")
+    def test_check_timeout(self, mock_sha, mock_find, mock_monotonic, mock_sleep):
+        """Check stays in_progress until timeout → passed=False."""
+        # monotonic() calls: deadline=0, grace=0, loop_check=1, loop_check=601
+        # loop 1: time.monotonic() < deadline → 1 < 600 → True; finds in_progress; sleeps
+        # loop 2: time.monotonic() < deadline → 601 < 600 → False → exit loop
+        mock_monotonic.side_effect = [0, 0, 1, 601]
+        mock_find.return_value = {
+            "id": 1, "status": "in_progress", "conclusion": "", "name": "orca-security-us",
+        }
+        result = orca_check_gate("https://github.com/owner/repo/pull/1", timeout_sec=600)
+        self.assertFalse(result.passed)
+        self.assertIn("did not complete", result.failures[0])
 
 # ---------------------------------------------------------------------------
 # Build root detection
@@ -1291,12 +1220,12 @@ class TestLLMValidationErrors(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Orca-CLI retry with feedback
+# Orca check retry with feedback (post-PR)
 # ---------------------------------------------------------------------------
 
-class TestOrcaCliRetry(unittest.TestCase):
-    """When orca-cli detects regressions, the fix agent should be re-invoked
-    with feedback describing the new findings."""
+class TestOrcaCheckRetry(unittest.TestCase):
+    """When the Orca GitHub App check detects regressions on a PR, the fix agent
+    should be re-invoked with feedback, re-validated locally, and pushed."""
 
     def _make_task(self):
         return AlertTask(
@@ -1310,11 +1239,12 @@ class TestOrcaCliRetry(unittest.TestCase):
 
     @patch("orchestrator._remove_worktree")
     @patch("orchestrator.subprocess.run")
-    @patch("orchestrator._commit_and_pr", return_value="https://github.com/pr/1")
+    @patch("orchestrator._push_fix_update")
+    @patch("orchestrator._commit_and_pr", return_value="https://github.com/owner/repo/pull/1")
     @patch("orchestrator.analyze_impact")
     @patch("orchestrator._get_diff", return_value="diff --git a/server.js")
     @patch("orchestrator.ci_gate")
-    @patch("orchestrator.orca_cli_validate")
+    @patch("orchestrator.orca_check_gate")
     @patch("orchestrator.local_build_check")
     @patch("orchestrator.llm_validate")
     @patch("orchestrator.sanity_check")
@@ -1323,9 +1253,8 @@ class TestOrcaCliRetry(unittest.TestCase):
     @patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-test"))
     def test_retry_on_orca_regression(
         self, mock_wt, mock_fix, mock_revert, mock_sanity, mock_llm, mock_build,
-        mock_orca, mock_ci, mock_diff, mock_impact, mock_pr, mock_subproc, mock_rm,
+        mock_orca, mock_ci, mock_diff, mock_impact, mock_pr, mock_push, mock_subproc, mock_rm,
     ):
-        from validator import ValidationResult
         from notifier import Notifier
 
         task = self._make_task()
@@ -1346,11 +1275,11 @@ class TestOrcaCliRetry(unittest.TestCase):
         mock_llm.return_value = val_pass
         mock_build.return_value = val_pass
 
-        # Orca-cli: fails first time (regression), passes second time
+        # Orca check: fails first time (regression), passes second time
         orca_fail = ValidationResult(
-            passed=False, phase="orca_cli",
-            failures=["orca-cli detected 2 new finding(s): server.js:41 [abc123], server.js:46 [def456]"])
-        orca_pass = ValidationResult(passed=True, phase="orca_cli")
+            passed=False, phase="orca_check",
+            failures=["server.js:41 [failure] new SAST finding introduced"])
+        orca_pass = ValidationResult(passed=True, phase="orca_check")
         mock_orca.side_effect = [orca_fail, orca_pass]
 
         mock_ci.return_value = ValidationResult(passed=True, phase="ci")
@@ -1367,10 +1296,19 @@ class TestOrcaCliRetry(unittest.TestCase):
         self.assertEqual(mock_fix.call_count, 2)
         second_call_kwargs = mock_fix.call_args_list[1]
         self.assertIn("feedback", second_call_kwargs.kwargs)
-        self.assertIn("orca-cli detected", second_call_kwargs.kwargs["feedback"])
+        self.assertIn("new SAST finding", second_call_kwargs.kwargs["feedback"])
+
+        # _push_fix_update was called for the retry
+        mock_push.assert_called_once()
 
     @patch("orchestrator._remove_worktree")
-    @patch("orchestrator.orca_cli_validate")
+    @patch("orchestrator.subprocess.run")
+    @patch("orchestrator._push_fix_update")
+    @patch("orchestrator._commit_and_pr", return_value="https://github.com/owner/repo/pull/1")
+    @patch("orchestrator.analyze_impact")
+    @patch("orchestrator._get_diff", return_value="diff --git a/server.js")
+    @patch("orchestrator.ci_gate")
+    @patch("orchestrator.orca_check_gate")
     @patch("orchestrator.local_build_check")
     @patch("orchestrator.llm_validate")
     @patch("orchestrator.sanity_check")
@@ -1379,9 +1317,8 @@ class TestOrcaCliRetry(unittest.TestCase):
     @patch("orchestrator._create_worktree", return_value=Path("/tmp/orca-fix-test"))
     def test_exhausted_retries_fails(
         self, mock_wt, mock_fix, mock_revert, mock_sanity, mock_llm, mock_build,
-        mock_orca, mock_rm,
+        mock_orca, mock_ci, mock_diff, mock_impact, mock_pr, mock_push, mock_subproc, mock_rm,
     ):
-        from validator import ValidationResult
         from notifier import Notifier
 
         task = self._make_task()
@@ -1397,27 +1334,23 @@ class TestOrcaCliRetry(unittest.TestCase):
         mock_llm.return_value = val_pass
         mock_build.return_value = val_pass
 
-        # Orca-cli always fails
+        # Orca check always fails
         orca_fail = ValidationResult(
-            passed=False, phase="orca_cli",
-            failures=["orca-cli detected 1 new finding(s): server.js:41 [abc123]"])
+            passed=False, phase="orca_check",
+            failures=["server.js:41 [failure] persistent SAST finding"])
         mock_orca.return_value = orca_fail
+
+        mock_ci.return_value = ValidationResult(passed=True, phase="ci")
+        mock_impact.return_value = ImpactResult(
+            level="low", description="minor", downtime_risk=False, requires_deploy=True)
 
         result = run_one(task, dry_run=False, notifier=notifier, repo=repo)
 
         self.assertEqual(result.state, "FAILED")
-        self.assertIn("orca-cli detected", result.failure_reason)
-        # Called initial + MAX_ORCA_RETRIES times
-        self.assertEqual(mock_fix.call_count, 1 + MAX_ORCA_RETRIES)
-
-
-    CASES = [
-        (
-            "feedback appended to prompt",
-            "orca-cli detected 3 new findings: file.js:10 [aaa], file.js:20 [bbb]",
-            "Previous Attempt Failed",
-        ),
-    ]
+        self.assertIn("persistent SAST finding", result.failure_reason)
+        # Called initial + config.orca_check.max_retries times
+        orca_retries = orchestrator.CFG.orca_check.max_retries
+        self.assertEqual(mock_fix.call_count, 1 + orca_retries)
 
     @patch("orchestrator.subprocess.run")
     def test_feedback_in_prompt(self, mock_run):
@@ -1429,13 +1362,48 @@ class TestOrcaCliRetry(unittest.TestCase):
         )
         task = self._make_task()
         task.worktree_path = Path("/tmp/test")
-        feedback = "orca-cli detected 2 new finding(s): server.js:41, server.js:46"
+        feedback = "server.js:41 [failure] Orca detected new finding"
 
         _invoke_fix_agent(task, dry_run=False, timeout_sec=60, feedback=feedback)
 
         prompt_arg = mock_run.call_args[0][0][2]  # cmd[2] is the prompt
         self.assertIn("Previous Attempt Failed", prompt_arg)
+        self.assertIn("Orca security check", prompt_arg)
         self.assertIn(feedback, prompt_arg)
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+class TestConfig(unittest.TestCase):
+    """Verify Config defaults and YAML loading."""
+
+    def test_defaults(self):
+        cfg = Config()
+        self.assertTrue(cfg.orca_check.enabled)
+        self.assertEqual(cfg.orca_check.check_name, "orca-security-us")
+        self.assertEqual(cfg.orca_check.timeout_sec, 600)
+        self.assertEqual(cfg.orca_check.max_retries, 1)
+        self.assertEqual(cfg.max_parallel_fixes, 4)
+        self.assertEqual(cfg.max_parallel_repos, 3)
+
+    def test_load_config_no_env(self):
+        """Without SECURITY_ENGINEER_CONFIG env var, defaults are used."""
+        import os
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SECURITY_ENGINEER_CONFIG", None)
+            cfg = load_config()
+        self.assertEqual(cfg.orca_check.check_name, "orca-security-us")
+        self.assertEqual(cfg.max_parallel_fixes, 4)
+
+    def test_orca_check_config_fields(self):
+        orca = OrcaCheckConfig(enabled=False, check_name="custom-check",
+                               timeout_sec=300, max_retries=2)
+        self.assertFalse(orca.enabled)
+        self.assertEqual(orca.check_name, "custom-check")
+        self.assertEqual(orca.timeout_sec, 300)
+        self.assertEqual(orca.max_retries, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -1461,17 +1429,15 @@ if __name__ == "__main__":
         TestWorktreeCwd,
         TestRemoteRouting,
         TestRunRepoPipelineCleanup,
-        TestScannerMapping,
-        TestFingerprintExtraction,
-        TestBeforeAfterComparison,
-        TestOrcaCliValidateSkip,
+        TestOrcaCheckGate,
         TestFindPackageJsonRoot,
         TestFindProjectRoot,
         TestExtractFilePath,
         TestBuildPromptContext,
         TestImpactAnalysisErrors,
         TestLLMValidationErrors,
-        TestOrcaCliRetry,
+        TestOrcaCheckRetry,
+        TestConfig,
     ]
 
     for cls in test_classes:

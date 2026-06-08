@@ -6,10 +6,12 @@ Phase 1: Python sanity checks — diff non-empty, size limits, no new secrets
 Phase 2: LLM validation — does the fix address the vulnerability?
 Phase 3: Local build/test — language-aware compile/lint
 Phase 4: GitHub CI gate — poll required PR checks (called after PR is opened)
+Phase 5: Orca GitHub App check — poll the orca-security-us check on the PR
 """
 import json
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -19,9 +21,18 @@ from _json_util import find_last_json_with_key
 @dataclass
 class ValidationResult:
     passed: bool
-    phase: str                        # "sanity" | "llm" | "local_build" | "ci"
+    phase: str                        # "sanity" | "llm" | "local_build" | "ci" | "orca_check"
     failures: list[str] = field(default_factory=list)
     needs_review: bool = False        # True when LLM verdict is "uncertain"
+
+
+@dataclass
+class OrcaCheckFinding:
+    """A single finding from the Orca GitHub App check annotations."""
+    file: str
+    line: int
+    message: str
+    severity: str  # "failure" | "warning" | "notice"
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +306,151 @@ def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
                                 failures=[f"CI checks failed: {reason}"])
 
     return ValidationResult(passed=True, phase="ci")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: Orca GitHub App check (post-PR)
+# ---------------------------------------------------------------------------
+
+def _parse_pr_url(pr_url: str) -> tuple[str, int]:
+    """Extract (owner/repo, pr_number) from a GitHub PR URL.
+
+    Returns (owner_repo, number) — e.g. ("owner/repo", 42).
+    Raises ValueError if the URL doesn't match.
+    """
+    m = re.match(r"https?://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr_url)
+    if not m:
+        raise ValueError(f"Cannot parse PR URL: {pr_url}")
+    return m.group(1), int(m.group(2))
+
+
+def _get_pr_head_sha(pr_url: str) -> str:
+    """Get the HEAD SHA for a PR using gh CLI."""
+    result = subprocess.run(
+        ["gh", "pr", "view", pr_url, "--json", "headRefOid", "--jq", ".headRefOid"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"gh pr view failed: {result.stderr[:200]}")
+    sha = result.stdout.strip()
+    if not sha:
+        raise RuntimeError("gh pr view returned empty SHA")
+    return sha
+
+
+def _find_orca_check_run(owner_repo: str, sha: str, check_name: str) -> dict | None:
+    """Find the Orca check run among commit check-runs. Case-insensitive substring match."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/{owner_repo}/commits/{sha}/check-runs",
+         "--jq", ".check_runs"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        runs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    check_lower = check_name.lower()
+    for run in (runs or []):
+        if check_lower in (run.get("name") or "").lower():
+            return run
+    return None
+
+
+def _get_check_annotations(owner_repo: str, check_run_id: int) -> list[OrcaCheckFinding]:
+    """Fetch annotations for a check run and return structured findings."""
+    result = subprocess.run(
+        ["gh", "api", f"repos/{owner_repo}/check-runs/{check_run_id}/annotations"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        return []
+    try:
+        annotations = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return []
+    findings = []
+    for ann in (annotations or []):
+        findings.append(OrcaCheckFinding(
+            file=ann.get("path", ""),
+            line=ann.get("start_line", 0),
+            message=ann.get("message", ""),
+            severity=ann.get("annotation_level", "warning"),
+        ))
+    return findings
+
+
+def orca_check_gate(
+    pr_url: str,
+    check_name: str = "orca-security-us",
+    timeout_sec: int = 600,
+    poll_interval: int = 15,
+) -> ValidationResult:
+    """Poll the Orca GitHub App check on a PR.
+
+    Returns a ValidationResult with:
+    - passed=True if the check succeeded/neutral or was not found after grace period
+    - passed=False if the check completed with failure, with structured findings in failures
+    - needs_review=True when the check was skipped or not found
+    """
+    try:
+        owner_repo, _ = _parse_pr_url(pr_url)
+    except ValueError as e:
+        return ValidationResult(passed=True, phase="orca_check", needs_review=True,
+                                failures=[str(e)])
+
+    try:
+        sha = _get_pr_head_sha(pr_url)
+    except (RuntimeError, subprocess.TimeoutExpired, FileNotFoundError) as e:
+        return ValidationResult(passed=True, phase="orca_check", needs_review=True,
+                                failures=[f"Could not get PR head SHA: {e}"])
+
+    deadline = time.monotonic() + timeout_sec
+    grace_deadline = time.monotonic() + 30  # 30s grace period for check to appear
+
+    while time.monotonic() < deadline:
+        run = _find_orca_check_run(owner_repo, sha, check_name)
+
+        if run is None:
+            if time.monotonic() > grace_deadline:
+                # Check never appeared — skip gracefully
+                print(f"[INFO] Orca check '{check_name}' not found on {sha[:8]}, skipping",
+                      flush=True)
+                return ValidationResult(passed=True, phase="orca_check", needs_review=True,
+                                        failures=[f"Orca check '{check_name}' not found on PR"])
+            time.sleep(poll_interval)
+            continue
+
+        status = run.get("status", "")
+        conclusion = run.get("conclusion", "")
+
+        if status in ("queued", "in_progress"):
+            print(f"[POLL] Orca check: {status}", flush=True)
+            time.sleep(poll_interval)
+            continue
+
+        if status == "completed":
+            if conclusion in ("success", "neutral"):
+                return ValidationResult(passed=True, phase="orca_check")
+            if conclusion == "skipped":
+                return ValidationResult(passed=True, phase="orca_check", needs_review=True,
+                                        failures=["Orca check was skipped"])
+
+            # failure / action_required — fetch annotations
+            check_run_id = run.get("id", 0)
+            findings = _get_check_annotations(owner_repo, check_run_id)
+            failure_msgs = []
+            for f in findings:
+                failure_msgs.append(f"{f.file}:{f.line} [{f.severity}] {f.message}")
+            if not failure_msgs:
+                failure_msgs = [f"Orca check concluded with '{conclusion}' (no annotations)"]
+
+            return ValidationResult(passed=False, phase="orca_check",
+                                    failures=failure_msgs)
+
+        # Unknown status — treat as in-progress
+        time.sleep(poll_interval)
+
+    return ValidationResult(passed=False, phase="orca_check",
+                            failures=[f"Orca check did not complete within {timeout_sec}s"])

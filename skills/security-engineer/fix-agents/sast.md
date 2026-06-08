@@ -101,3 +101,21 @@ http.ListenAndServe(":8080", mux)
 srv.ListenAndServeTLS("cert.pem", "key.pem")
 ```
 
+---
+
+## Handling Orca Check Feedback
+
+If the orchestrator re-invokes you with feedback from the Orca security check, it means your previous fix introduced **new** SAST findings on the PR.
+
+**Common causes:**
+- Your fix moved the vulnerability rather than eliminating it (e.g., unsanitized input now flows to a different sink)
+- You introduced a new code pattern that triggers a different CWE (e.g., fixing SQL injection but adding command injection)
+- You used string operations on user input that don't fully neutralize the threat
+
+**How to respond:**
+1. Read the finding's file and line number from the feedback
+2. Understand the new sink or vulnerable pattern your fix created
+3. Apply proper input validation/sanitization at the new location
+4. Prefer allowlist-based validation over blocklist approaches
+5. If the original fix approach fundamentally cannot work without introducing new issues, consider a different strategy entirely (e.g., use a library function instead of manual sanitization)
+

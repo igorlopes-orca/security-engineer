@@ -91,3 +91,20 @@ ENV API_KEY=""
 - If the secret appears in multiple files, fix all occurrences in the same branch/PR.
 - The PR body must list every env var name that needs to be set by operators after merge.
 
+---
+
+## Handling Orca Check Feedback
+
+If the orchestrator re-invokes you with feedback from the Orca security check, it means your fix introduced **new** secret pattern detections on the PR.
+
+**Common causes:**
+- Your fix moved the secret to a different location rather than removing it
+- You replaced the secret with a placeholder that still looks like a real credential
+- You added example/test values that match secret detection patterns
+
+**How to respond:**
+1. Ensure the credential is replaced with an environment variable reference, not relocated
+2. Do not use realistic-looking placeholder values (e.g., `sk-placeholder123`) — use empty strings or `""` with a comment
+3. If the secret appears in test files, use clearly fake values that won't trigger detectors (e.g., `test-token-not-real`)
+4. Check that all occurrences across all files in the repo are addressed, not just the primary one
+

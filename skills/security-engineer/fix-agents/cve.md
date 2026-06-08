@@ -91,3 +91,20 @@ The patched version should be in the alert's `recommendation` field. If it's not
 
 Do NOT bump to a major version without confirming compatibility — prefer the minimum patched version.
 
+---
+
+## Handling Orca Check Feedback
+
+If the orchestrator re-invokes you with feedback from the Orca security check, it means your version bump introduced **new** dependency vulnerabilities on the PR.
+
+**Common causes:**
+- The target version pulls in transitive dependencies with known CVEs
+- You bumped to a version that itself has a newer CVE
+- The lockfile regeneration resolved to an insecure transitive version
+
+**How to respond:**
+1. Check whether the target version introduces transitive CVEs — try a different patch version
+2. If the direct dependency version is safe but a transitive dep is vulnerable, pin the transitive dependency explicitly
+3. Try the latest patch in the same minor series rather than jumping to a new minor/major
+4. If no safe version exists, note it in the output as a manual step for the reviewer
+

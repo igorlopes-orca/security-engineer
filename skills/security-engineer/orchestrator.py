@@ -30,17 +30,18 @@ from orca_client import (RISK_ORDER, alert_branch_name, Repository,
                          _resolve_feature_type)
 
 from _json_util import find_last_json_with_key
+from config import load_config
 from notifier import build_notifiers, NotificationPayload
-from validator import sanity_check, llm_validate, local_build_check, ci_gate
-from orca_cli_validator import orca_cli_validate
+from validator import (sanity_check, llm_validate, local_build_check,
+                       ci_gate, orca_check_gate)
 from impact_agent import analyze_impact, ImpactResult
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
 
-MAX_WORKERS = 4
-REPO_WORKERS = 3    # concurrent repos in --all-repos mode (total agents = REPO_WORKERS × MAX_WORKERS)
+CFG = load_config()
+MAX_WORKERS = CFG.max_parallel_fixes
+REPO_WORKERS = CFG.max_parallel_repos
 MAX_RETRIES = 2
-MAX_ORCA_RETRIES = 1   # re-invoke fix agent once with orca-cli feedback
 RETRYABLE_ERRORS = {"json_parse_failure", "subprocess_error"}
 TIMEOUTS = {"sast": 180, "iac": 120, "secret": 120, "cve": 240}
 
@@ -277,10 +278,13 @@ def _invoke_fix_agent(task: AlertTask, dry_run: bool, timeout_sec: int,
     if feedback:
         prompt += (
             "\n\n## Previous Attempt Failed\n\n"
-            "Your previous fix introduced new security findings detected by orca-cli:\n"
+            "Your previous fix introduced new security findings detected by "
+            "the Orca security check on the PR:\n\n"
             f"{feedback}\n\n"
-            "Revert your approach and try a different fix strategy that does not "
-            "introduce these issues.\n"
+            "Each finding includes the file, line number, and description of the issue.\n"
+            "Read the affected files, understand why your fix introduced these problems, "
+            "and apply a different approach that resolves the original vulnerability "
+            "without creating new ones.\n"
             "Do NOT repeat the same fix. Read the file again and find an "
             "alternative approach."
         )
@@ -400,6 +404,14 @@ def _commit_and_pr(task: AlertTask, impact: Optional[ImpactResult], dry_run: boo
     return pr_url
 
 
+def _push_fix_update(task: AlertTask) -> None:
+    """Stage, commit, and push updated fix to the existing PR branch."""
+    commit_msg = f"fix(security): retry fix for {task.alert_id}"
+    _run(["git", "add", "-A"], cwd=task.worktree_path)
+    _run(["git", "commit", "-m", commit_msg], cwd=task.worktree_path)
+    _run(["git", "push"], cwd=task.worktree_path)
+
+
 # ---------------------------------------------------------------------------
 # Per-alert state machine
 # ---------------------------------------------------------------------------
@@ -497,91 +509,45 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
-    # Validation phases 1-3b with orca-cli retry loop
-    orca_feedback: str | None = None
-    timeout = TIMEOUTS.get(task.feature_type, 180)
-
-    for orca_attempt in range(MAX_ORCA_RETRIES + 1):
-        # On retry: revert the bad fix and re-invoke agent with feedback
-        if orca_attempt > 0:
-            print(f"[RETRY] {task.alert_id} orca-cli found regressions, "
-                  f"retrying fix (attempt {orca_attempt + 1})")
-            _revert(task.worktree_path)
-            fix_result = _invoke_fix_agent(task, dry_run, timeout,
-                                           feedback=orca_feedback)
-            if not fix_result.success:
-                task.state = "FAILED"
-                task.failure_reason = fix_result.failure_reason
-                p = _notify_payload(task)
-                p.repo = repo.name
-                notifier.notify("fix_failed", p)
-                _remove_worktree(task.worktree_path, branch, repo=repo)
-                return task
-            task.fix_result = fix_result
-
-        # Phase 1: sanity
-        task.state = "VALIDATE_LOCAL"
-        print(f"[PHASE] {task.alert_id} sanity check", flush=True)
-        sanity = sanity_check(task.alert_json, task.worktree_path)
-        if not sanity.passed:
-            task.state = "FAILED"
-            task.failure_reason = "; ".join(sanity.failures)
-            p = _notify_payload(task)
-            p.repo = repo.name
-            notifier.notify("validation_failed", p)
-            _revert(task.worktree_path)
-            _remove_worktree(task.worktree_path, branch, repo=repo)
-            return task
-
-        # Phase 2: LLM validation
-        print(f"[PHASE] {task.alert_id} LLM validation", flush=True)
-        llm_val = llm_validate(task.alert_json, task.worktree_path)
-        if not llm_val.passed:
-            task.state = "FAILED"
-            task.failure_reason = "; ".join(llm_val.failures)
-            p = _notify_payload(task)
-            p.repo = repo.name
-            notifier.notify("validation_failed", p)
-            _revert(task.worktree_path)
-            _remove_worktree(task.worktree_path, branch, repo=repo)
-            return task
-        if llm_val.needs_review:
-            task.needs_review = True
-
-        # Phase 3: local build
-        print(f"[PHASE] {task.alert_id} local build check", flush=True)
-        local_val = local_build_check(
-            fix_result.files_changed, task.worktree_path,
-            source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
-        )
-        if not local_val.passed:
-            task.state = "FAILED"
-            task.failure_reason = "; ".join(local_val.failures)
-            p = _notify_payload(task)
-            p.repo = repo.name
-            notifier.notify("validation_failed", p)
-            _revert(task.worktree_path)
-            _remove_worktree(task.worktree_path, branch, repo=repo)
-            return task
-
-        # Phase 3b: orca-cli validation (before/after scan)
-        task.state = "VALIDATE_ORCA_CLI"
-        print(f"[PHASE] {task.alert_id} orca-cli before/after scan", flush=True)
-        orca_val = orca_cli_validate(
-            task.alert_json, task.worktree_path, task.feature_type)
-        if orca_val.passed:
-            if orca_val.needs_review:
-                task.needs_review = True
-            break  # all validations passed
-
-        # Orca-cli failed — retry or give up
-        if orca_attempt < MAX_ORCA_RETRIES:
-            orca_feedback = "; ".join(orca_val.failures)
-            continue
-
-        # Final attempt exhausted
+    # Pre-PR validation (linear — no retry wrapping)
+    # Phase 1: sanity
+    task.state = "VALIDATE_LOCAL"
+    print(f"[PHASE] {task.alert_id} sanity check", flush=True)
+    sanity = sanity_check(task.alert_json, task.worktree_path)
+    if not sanity.passed:
         task.state = "FAILED"
-        task.failure_reason = "; ".join(orca_val.failures)
+        task.failure_reason = "; ".join(sanity.failures)
+        p = _notify_payload(task)
+        p.repo = repo.name
+        notifier.notify("validation_failed", p)
+        _revert(task.worktree_path)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
+        return task
+
+    # Phase 2: LLM validation
+    print(f"[PHASE] {task.alert_id} LLM validation", flush=True)
+    llm_val = llm_validate(task.alert_json, task.worktree_path)
+    if not llm_val.passed:
+        task.state = "FAILED"
+        task.failure_reason = "; ".join(llm_val.failures)
+        p = _notify_payload(task)
+        p.repo = repo.name
+        notifier.notify("validation_failed", p)
+        _revert(task.worktree_path)
+        _remove_worktree(task.worktree_path, branch, repo=repo)
+        return task
+    if llm_val.needs_review:
+        task.needs_review = True
+
+    # Phase 3: local build
+    print(f"[PHASE] {task.alert_id} local build check", flush=True)
+    local_val = local_build_check(
+        fix_result.files_changed, task.worktree_path,
+        source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
+    )
+    if not local_val.passed:
+        task.state = "FAILED"
+        task.failure_reason = "; ".join(local_val.failures)
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("validation_failed", p)
@@ -624,7 +590,98 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
 
     task.state = "PR_OPENING"
 
-    # Phase 4: CI gate
+    # Phase 4: Orca GitHub App check (post-PR) with retry
+    if pr_url and CFG.orca_check.enabled:
+        orca_cfg = CFG.orca_check
+        for orca_attempt in range(orca_cfg.max_retries + 1):
+            task.state = "VALIDATE_ORCA_CHECK"
+            print(f"[PHASE] {task.alert_id} polling Orca check "
+                  f"(attempt {orca_attempt + 1}/{orca_cfg.max_retries + 1})", flush=True)
+            orca_val = orca_check_gate(
+                pr_url,
+                check_name=orca_cfg.check_name,
+                timeout_sec=orca_cfg.timeout_sec,
+                poll_interval=orca_cfg.poll_interval_sec,
+            )
+            if orca_val.passed:
+                if orca_val.needs_review:
+                    task.needs_review = True
+                break
+
+            # Orca check failed — retry with feedback or handle per config
+            if orca_attempt < orca_cfg.max_retries:
+                orca_feedback = "\n".join(orca_val.failures)
+                print(f"[RETRY] {task.alert_id} Orca check found issues, "
+                      f"retrying fix (attempt {orca_attempt + 2})", flush=True)
+                _revert(task.worktree_path)
+                timeout = TIMEOUTS.get(task.feature_type, 180)
+                fix_result = _invoke_fix_agent(task, dry_run, timeout,
+                                               feedback=orca_feedback)
+                if not fix_result.success:
+                    task.state = "FAILED"
+                    task.failure_reason = fix_result.failure_reason
+                    p = _notify_payload(task)
+                    p.repo = repo.name
+                    notifier.notify("fix_failed", p)
+                    _remove_worktree(task.worktree_path, branch, repo=repo)
+                    return task
+                task.fix_result = fix_result
+
+                # Re-validate locally before pushing
+                sanity2 = sanity_check(task.alert_json, task.worktree_path)
+                if not sanity2.passed:
+                    task.state = "FAILED"
+                    task.failure_reason = "; ".join(sanity2.failures)
+                    p = _notify_payload(task)
+                    p.repo = repo.name
+                    notifier.notify("validation_failed", p)
+                    _remove_worktree(task.worktree_path, branch, repo=repo)
+                    return task
+
+                build2 = local_build_check(
+                    fix_result.files_changed, task.worktree_path,
+                    source_file=task.alert_json.get("file_path") or task.alert_json.get("source", ""),
+                )
+                if not build2.passed:
+                    task.state = "FAILED"
+                    task.failure_reason = "; ".join(build2.failures)
+                    p = _notify_payload(task)
+                    p.repo = repo.name
+                    notifier.notify("validation_failed", p)
+                    _remove_worktree(task.worktree_path, branch, repo=repo)
+                    return task
+
+                # Push updated fix to same PR branch
+                try:
+                    _push_fix_update(task)
+                except RuntimeError as e:
+                    task.state = "FAILED"
+                    task.failure_reason = f"push fix update failed: {e}"
+                    p = _notify_payload(task)
+                    p.repo = repo.name
+                    notifier.notify("fix_failed", p)
+                    _remove_worktree(task.worktree_path, branch, repo=repo)
+                    return task
+                continue
+
+            # All retries exhausted
+            on_fail = orca_cfg.on_failure
+            if on_fail == "skip":
+                task.needs_review = True
+                print(f"[WARN] {task.alert_id} Orca check failed, skipping per config",
+                      flush=True)
+                break
+            else:
+                # "fail" or default
+                task.state = "FAILED"
+                task.failure_reason = "; ".join(orca_val.failures)
+                p = _notify_payload(task)
+                p.repo = repo.name
+                notifier.notify("validation_failed", p)
+                _remove_worktree(task.worktree_path, branch, repo=repo)
+                return task
+
+    # Phase 5: CI gate
     if pr_url:
         print(f"[PHASE] {task.alert_id} waiting for CI checks", flush=True)
         task.state = "VALIDATE_CI"
