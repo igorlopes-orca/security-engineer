@@ -112,11 +112,11 @@ For each alert (up to 4 in parallel, isolated git worktree per alert):
   3. validate (Phase 1)     -> Python: diff non-empty, diff size, no new secrets
   4. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
   5. validate (Phase 3)     -> Local build (see Language Coverage below)
-  6. validate (Phase 3b)    -> orca-cli before/after scan (see Orca CLI Validation below)
-  7. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
-  8. git-commit             -> run_agent.py git-commit
-  9. open-pr                -> run_agent.py open-pr (includes impact in PR body)
- 10. validate (Phase 4)     -> CI gate: gh pr checks --watch (timeout: 10min)
+  6. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
+  7. git-commit             -> run_agent.py git-commit
+  8. open-pr                -> run_agent.py open-pr (includes impact in PR body)
+  9. validate (Phase 4)     -> Orca check gate (see Orca Check Gate below)
+ 10. validate (Phase 5)     -> CI gate: gh pr checks --watch (timeout: 10min)
  11. notify                 -> console + log file + GitHub PR comment
  12. remove_worktree        -> cleanup /tmp/orca-fix-<id> + local branch
 ```
@@ -141,33 +141,40 @@ Adds a repo-level wrapper around the per-alert pipeline above.
 Max concurrent Claude subprocesses: 3 repos x 4 alerts = 12
 ```
 
-## Orca CLI Validation
+## Orca Check Gate
 
-Phase 3b runs a before/after `orca-cli` scan to verify the fix and detect regressions:
+Phase 4 runs **after the PR is opened**: it polls the Orca GitHub App check (default
+`orca-security-us`) on the PR head commit via the `gh` CLI and treats new findings the
+App reports as regressions introduced by the fix.
 
-1. **Stash** the fix (revert to pre-fix state)
-2. **Scan baseline** with the appropriate scanner
-3. **Pop** the fix (re-apply)
-4. **Scan again** with fix applied
-5. **Compare fingerprints**: findings that disappeared = fix verified; new findings = regression
+1. **Resolve** the PR head SHA (`gh pr view`)
+2. **Find** the Orca check run among the commit's check-runs (case-insensitive name match)
+3. **Poll** until the check completes or `timeout_sec` elapses
+4. **On failure**, fetch the check annotations (file, line, message, severity) as findings
 
-| Alert type | Scanner | Command |
-|---|---|---|
-| sast | SAST | `orca-cli sast scan --path <worktree>` |
-| iac | IaC | `orca-cli iac scan --path <worktree>` |
-| cve | SCA | `orca-cli sca scan --path <worktree>` |
-| secret | Secrets | `orca-cli secrets scan --path <worktree>` |
+**Retry on failure:** when the check reports findings, the orchestrator reverts the fix,
+re-invokes the fix agent with the annotations as feedback, re-validates locally
+(sanity + build), and pushes the new fix to the same PR branch — up to `max_retries`
+times. After retries are exhausted, behavior follows `on_failure` (`retry`/`fail`/`skip`).
 
 **Pass conditions:**
-- No new findings introduced by the fix
-- If no findings disappeared, the PR is flagged `needs-review` (the scanner may not cover the exact alert)
+- Check concludes `success` or `neutral`
+- Check `skipped` or not found after the grace period → passes, flagged `needs-review`
 
-**Skip conditions** (validation passes, flagged for review):
-- `orca-cli` not installed
-- `ORCA_SECURITY_API_TOKEN` / `ORCA_API_TOKEN` not set
-- No diff to compare
+**Configuration** (`config.py`, overridable via `SECURITY_ENGINEER_CONFIG` YAML):
 
-**Environment:** Uses `ORCA_SECURITY_API_TOKEN` or falls back to `ORCA_API_TOKEN`. Scans use `--skip-scan-log` to avoid polluting the Orca platform.
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Run the gate at all |
+| `check_name` | `orca-security-us` | Substring matched against check-run names |
+| `timeout_sec` | `600` | Max time to wait for the check to complete |
+| `poll_interval_sec` | `15` | Delay between polls |
+| `max_retries` | `1` | Fix-agent re-invocations on failure |
+| `on_failure` | `retry` | `retry` \| `fail` \| `skip` after retries exhausted |
+| `on_not_found` | `skip` | `skip` \| `fail` when the check never appears |
+
+**Environment:** Relies on `gh` being authenticated for the target repo; no `orca-cli`
+binary or API token is needed on the runner.
 
 ## Language Coverage
 
