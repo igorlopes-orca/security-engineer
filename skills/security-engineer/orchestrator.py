@@ -33,7 +33,7 @@ from _json_util import find_last_json_with_key
 from config import load_config
 from notifier import build_notifiers, NotificationPayload
 from validator import (sanity_check, llm_validate, local_build_check,
-                       ci_gate, orca_check_gate)
+                       ci_gate, orca_check_gate, worktree_diff)
 from impact_agent import analyze_impact, ImpactResult
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
@@ -44,6 +44,9 @@ REPO_WORKERS = CFG.max_parallel_repos
 MAX_RETRIES = 2
 RETRYABLE_ERRORS = {"json_parse_failure", "subprocess_error"}
 TIMEOUTS = {"sast": 180, "iac": 120, "secret": 120, "cve": 240}
+
+# Base branch that fix branches are cut from and PRs target.
+BASE_BRANCH = "main"
 
 
 # ---------------------------------------------------------------------------
@@ -96,19 +99,86 @@ def _run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None) -> tupl
 # Git worktree helpers
 # ---------------------------------------------------------------------------
 
+class WorktreeConflict(RuntimeError):
+    """The branch or worktree holds work we must not destroy — skip this alert.
+
+    Distinct from a plain RuntimeError, which means setup genuinely failed. The
+    caller maps this to SKIPPED and everything else to FAILED, so a leftover
+    directory can no longer masquerade as "branch already exists".
+    """
+
+
+def _worktree_path(alert_id: str, repo: Optional[Repository] = None) -> Path:
+    """Namespace the worktree by repo so parallel --remote all runs cannot collide."""
+    prefix = f"{repo.name.replace('/', '-')}-" if (repo and repo.name) else ""
+    return Path(f"/tmp/orca-fix-{prefix}{alert_id}")
+
+
+def _local_branch_exists(branch: str, cwd: Optional[str]) -> bool:
+    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
+                        f"refs/heads/{branch}"],
+                       capture_output=True, text=True, cwd=cwd)
+    return r.returncode == 0
+
+
+def _branch_has_own_commits(branch: str, cwd: Optional[str]) -> bool:
+    """True if `branch` carries commits that BASE_BRANCH does not.
+
+    Separates a leaked empty branch (safe to reclaim) from one holding real work —
+    a human's branch, or a crashed run that got as far as committing. Anything we
+    cannot inspect counts as having commits, so we never force-delete blindly.
+    """
+    r = subprocess.run(["git", "rev-list", "--count", f"{BASE_BRANCH}..{branch}"],
+                       capture_output=True, text=True, cwd=cwd)
+    if r.returncode != 0:
+        return True
+    count = (r.stdout or "").strip()
+    return count != "0"
+
+
 def _create_worktree(alert_id: str, branch: str, repo: Optional[Repository] = None) -> Path:
-    """Create an isolated git worktree with a new branch checked out from main.
+    """Create an isolated git worktree with `branch` checked out from BASE_BRANCH.
+
+    Clears leftovers from an earlier crashed run first — a stale directory used to
+    make `git worktree add` fail with "already exists", which the caller misread as
+    a pre-existing branch and skipped the alert on every subsequent run.
 
     repo: when set (multi-repo mode) all git commands run inside repo.clone_path.
           When None, uses the current working directory (single-repo mode).
+
+    Raises WorktreeConflict if the alert should be skipped, RuntimeError if setup
+    failed for any other reason.
     """
-    path = Path(f"/tmp/orca-fix-{alert_id}")
+    path = _worktree_path(alert_id, repo)
     cwd = str(repo.clone_path) if (repo and repo.clone_path) else None
+
+    # Drop registrations whose directories no longer exist.
+    subprocess.run(["git", "worktree", "prune"], capture_output=True, cwd=cwd)
+
     if path.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(path)],
                        capture_output=True, cwd=cwd)
-    subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
-    _run(["git", "worktree", "add", "-b", branch, str(path), "main"], cwd=cwd)
+        if path.exists():
+            # Not a registered worktree of this repo — e.g. the clone it belonged
+            # to was already deleted. Ours by naming convention, so clear it.
+            shutil.rmtree(path, ignore_errors=True)
+        if path.exists():
+            raise RuntimeError(f"could not clear stale worktree at {path}")
+
+    if _local_branch_exists(branch, cwd):
+        if _branch_has_own_commits(branch, cwd):
+            raise WorktreeConflict(
+                f"local branch {branch} has commits not in {BASE_BRANCH} — "
+                f"left untouched for review")
+        subprocess.run(["git", "branch", "-D", branch], capture_output=True, cwd=cwd)
+
+    _, stderr, rc = _run(["git", "worktree", "add", "-b", branch, str(path), BASE_BRANCH],
+                         check=False, cwd=cwd)
+    if rc != 0:
+        msg = stderr.strip() or f"git worktree add failed (exit {rc})"
+        if "already used by worktree" in msg or "already exists" in msg:
+            raise WorktreeConflict(msg)
+        raise RuntimeError(msg)
     return path
 
 
@@ -127,8 +197,8 @@ def _remove_worktree(path: Optional[Path], branch: Optional[str] = None,
 
 
 def _get_diff(worktree_path: Path) -> str:
-    r = subprocess.run(["git", "diff"], cwd=worktree_path, capture_output=True, text=True)
-    return r.stdout
+    """Diff shown to the impact agent — same view the pre-PR gates judged."""
+    return worktree_diff(worktree_path)
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +487,17 @@ def _push_fix_update(task: AlertTask) -> None:
 # ---------------------------------------------------------------------------
 
 def _revert(worktree_path: Path) -> None:
-    subprocess.run(["git", "checkout", "--", "."], cwd=worktree_path, capture_output=True)
+    """Restore the worktree to HEAD, including anything the fix agent created.
+
+    `git checkout -- .` alone leaves untracked files in place and leaves the
+    intent-to-add entries that worktree_diff() registers, so a "reverted" tree
+    would still show a diff. `git clean -fd` honours .gitignore, so ignored build
+    artefacts (node_modules, vendor) survive.
+    """
+    for cmd in (["git", "reset", "-q"],
+                ["git", "checkout", "--", "."],
+                ["git", "clean", "-fdq"]):
+        subprocess.run(cmd, cwd=worktree_path, capture_output=True)
 
 
 def _notify_payload(task: AlertTask) -> NotificationPayload:
@@ -437,7 +517,12 @@ def _notify_payload(task: AlertTask) -> NotificationPayload:
 
 
 def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> AlertTask:
-    """Drive a single alert through the full fix pipeline.
+    """Drive a single alert through the full fix pipeline, always cleaning up.
+
+    Worktree teardown lives in a finally so an unexpected exception cannot leak
+    /tmp/orca-fix-* plus a local branch. A leak used to be self-perpetuating: the
+    leftover directory made the next run fail worktree creation, which was then
+    reported as "branch already exists" and skipped forever.
 
     repo.clone_path controls where git operations run:
       None  → current working directory (single-repo mode, existing behaviour)
@@ -445,18 +530,29 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
     """
     branch = alert_branch_name(task.alert_id)
 
-    # Create worktree
     try:
         task.worktree_path = _create_worktree(task.alert_id, branch, repo=repo)
+    except WorktreeConflict as e:
+        task.state = "SKIPPED"
+        task.failure_reason = str(e)
+        return task
     except RuntimeError as e:
-        if "already exists" in str(e):
-            task.state = "SKIPPED"
-            task.failure_reason = "branch already exists"
-            return task
         task.state = "FAILED"
         task.failure_reason = f"worktree creation failed: {e}"
         return task
 
+    try:
+        return _run_pipeline(task, dry_run, notifier, repo)
+    finally:
+        _remove_worktree(task.worktree_path, branch, repo=repo)
+
+
+def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> AlertTask:
+    """Fix → validate → impact → PR → post-PR gates for one alert.
+
+    Assumes the worktree exists; run_one owns its lifetime. Nothing in here
+    performs cleanup, so every exit path is a plain `return task`.
+    """
     p = _notify_payload(task)
     p.repo = repo.name
     notifier.notify("fix_started", p)
@@ -476,7 +572,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
             p = _notify_payload(task)
             p.repo = repo.name
             notifier.notify("timeout", p)
-            _remove_worktree(task.worktree_path, branch, repo=repo)
             return task
 
         if fix_result.success:
@@ -494,7 +589,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("fix_failed", p)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     task.fix_result = fix_result
@@ -506,22 +600,20 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         p.repo = repo.name
         p.detail = fix_result.diff_summary or ""
         notifier.notify("fix_planned", p)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Pre-PR validation (linear — no retry wrapping)
     # Phase 1: sanity
     task.state = "VALIDATE_LOCAL"
     print(f"[PHASE] {task.alert_id} sanity check", flush=True)
-    sanity = sanity_check(task.alert_json, task.worktree_path)
+    sanity = sanity_check(task.alert_json, task.worktree_path,
+                          feature_type=task.feature_type)
     if not sanity.passed:
         task.state = "FAILED"
         task.failure_reason = "; ".join(sanity.failures)
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Phase 2: LLM validation
@@ -533,8 +625,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
     if llm_val.needs_review:
         task.needs_review = True
@@ -551,8 +641,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("validation_failed", p)
-        _revert(task.worktree_path)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     # Impact analysis
@@ -574,7 +662,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
         p = _notify_payload(task)
         p.repo = repo.name
         notifier.notify("fix_failed", p)
-        _remove_worktree(task.worktree_path, branch, repo=repo)
         return task
 
     task.pr_url = pr_url
@@ -623,19 +710,18 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("fix_failed", p)
-                    _remove_worktree(task.worktree_path, branch, repo=repo)
                     return task
                 task.fix_result = fix_result
 
                 # Re-validate locally before pushing
-                sanity2 = sanity_check(task.alert_json, task.worktree_path)
+                sanity2 = sanity_check(task.alert_json, task.worktree_path,
+                                       feature_type=task.feature_type)
                 if not sanity2.passed:
                     task.state = "FAILED"
                     task.failure_reason = "; ".join(sanity2.failures)
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("validation_failed", p)
-                    _remove_worktree(task.worktree_path, branch, repo=repo)
                     return task
 
                 build2 = local_build_check(
@@ -648,7 +734,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("validation_failed", p)
-                    _remove_worktree(task.worktree_path, branch, repo=repo)
                     return task
 
                 # Push updated fix to same PR branch
@@ -660,7 +745,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
                     p = _notify_payload(task)
                     p.repo = repo.name
                     notifier.notify("fix_failed", p)
-                    _remove_worktree(task.worktree_path, branch, repo=repo)
                     return task
                 continue
 
@@ -678,7 +762,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
                 p = _notify_payload(task)
                 p.repo = repo.name
                 notifier.notify("validation_failed", p)
-                _remove_worktree(task.worktree_path, branch, repo=repo)
                 return task
 
     # Phase 5: CI gate
@@ -724,7 +807,6 @@ def run_one(task: AlertTask, dry_run: bool, notifier, repo: Repository) -> Alert
     p = _notify_payload(task)
     p.repo = repo.name
     notifier.notify("fix_succeeded", p)
-    _remove_worktree(task.worktree_path, branch, repo=repo)
     return task
 
 

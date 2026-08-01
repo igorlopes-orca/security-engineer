@@ -5,9 +5,13 @@ Multi-phase validation pipeline for security fixes.
 Phase 1: Python sanity checks — diff non-empty, size limits, no new secrets
 Phase 2: LLM validation — does the fix address the vulnerability?
 Phase 3: Local build/test — language-aware compile/lint
-Phase 4: GitHub CI gate — poll required PR checks (called after PR is opened)
-Phase 5: Orca GitHub App check — poll the orca-security-us check on the PR
+Phase 4: Orca GitHub App check — poll the orca-security-us check on the PR
+Phase 5: GitHub CI gate — poll required PR checks
+
+Phases 1-3 run pre-PR; 4 and 5 run after the PR is opened. All three pre-PR
+gates read worktree_diff() so they judge exactly what the commit will contain.
 """
+
 import json
 import re
 import subprocess
@@ -16,6 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
+from orca_client import _resolve_feature_type
 
 
 @dataclass
@@ -36,6 +41,36 @@ class OrcaCheckFinding:
 
 
 # ---------------------------------------------------------------------------
+# Shared: the diff every gate is judged against
+# ---------------------------------------------------------------------------
+
+def worktree_diff(worktree_path: Path) -> str:
+    """Return the diff of everything a subsequent `git add -A` would commit.
+
+    Plain `git diff` only reports tracked, unstaged changes, so it misses files
+    the fix agent created — a fix that only adds a file looks like an empty diff.
+    `git add -A -N` registers untracked files as intent-to-add so their content
+    shows up, which keeps every gate (sanity, LLM, impact) judging the same set
+    of changes the commit will actually contain. Honours .gitignore.
+    """
+    subprocess.run(["git", "add", "-A", "-N"],
+                   cwd=worktree_path, capture_output=True, text=True)
+    return subprocess.run(["git", "diff"],
+                          cwd=worktree_path, capture_output=True, text=True).stdout
+
+
+def diff_line_count(diff_text: str) -> int:
+    """Count added + removed lines in a unified diff, excluding file headers."""
+    total = 0
+    for line in diff_text.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+") or line.startswith("-"):
+            total += 1
+    return total
+
+
+# ---------------------------------------------------------------------------
 # Phase 1: Sanity checks (Python, always)
 # ---------------------------------------------------------------------------
 
@@ -48,32 +83,30 @@ _SECRET_PATTERNS = [
 ]
 
 
-def sanity_check(alert: dict, worktree_path: Path) -> ValidationResult:
-    failures = []
+def sanity_check(alert: dict, worktree_path: Path,
+                 feature_type: str | None = None) -> ValidationResult:
+    """Phase 1 gate: the diff is non-empty, within size limits, and adds no secrets.
 
-    stat = subprocess.run(
-        ["git", "diff", "--stat"],
-        cwd=worktree_path, capture_output=True, text=True
-    ).stdout.strip()
-    if not stat:
+    feature_type: the *resolved* type ("cve"/"sast"/"iac"/"secret"), which selects
+                  the diff-size limit. Alert JSON carries Orca's raw feature_type,
+                  and that is empty for package CVEs — they are identified by
+                  category instead — so relying on it silently applied the 50-line
+                  sast limit to lockfile bumps that legitimately need 200.
+    """
+    failures = []
+    ft = (feature_type or _resolve_feature_type(alert) or "sast").lower()
+
+    diff_text = worktree_diff(worktree_path)
+    if not diff_text.strip():
         return ValidationResult(passed=False, phase="sanity",
                                 failures=["git diff is empty — no changes were made"])
 
-    shortstat = subprocess.run(
-        ["git", "diff", "--shortstat"],
-        cwd=worktree_path, capture_output=True, text=True
-    ).stdout
-    total = sum(int(n) for n in re.findall(r"(\d+) (?:insertion|deletion)", shortstat))
-    ft = (alert.get("feature_type") or "sast").lower()
+    total = diff_line_count(diff_text)
     limit = _DIFF_LIMITS.get(ft, 50)
     if total > limit:
         failures.append(f"diff too large: {total} lines changed (limit {limit} for {ft})")
 
     if ft == "secret":
-        diff_text = subprocess.run(
-            ["git", "diff"],
-            cwd=worktree_path, capture_output=True, text=True
-        ).stdout
         added = [l for l in diff_text.splitlines()
                  if l.startswith("+") and not l.startswith("+++")]
         for line in added:
@@ -114,10 +147,7 @@ Return ONLY this JSON as your final output (nothing after):
 
 
 def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> ValidationResult:
-    diff_text = subprocess.run(
-        ["git", "diff"],
-        cwd=worktree_path, capture_output=True, text=True
-    ).stdout[:5000]
+    diff_text = worktree_diff(worktree_path)[:5000]
 
     prompt = _LLM_PROMPT.format(
         alert_json=json.dumps(alert, indent=2),

@@ -8,8 +8,10 @@ Verifies that argument parsing, filter logic, and flag enforcement
 Run with: python3 tests/test_orchestrator.py
 No API token or network access required — all tests are pure Python.
 """
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock, call
@@ -657,6 +659,7 @@ class TestWorktreeCwd(unittest.TestCase):
 
                 with patch("orchestrator._run", side_effect=fake_run), \
                      patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+                     patch("orchestrator._local_branch_exists", return_value=False), \
                      patch.object(Path, "exists", return_value=False):
                     orchestrator._create_worktree("orca-test", "fix/orca-test", repo=repo)
 
@@ -1200,16 +1203,17 @@ class TestLLMValidationErrors(unittest.TestCase):
 
     @patch("validator.subprocess.run")
     def test_failures_populated(self, mock_run):
-        # First call is git diff, second is claude subprocess
+        # worktree_diff() runs `git add -A -N` then `git diff`; claude is third.
+        git_add_result = subprocess.CompletedProcess(
+            args=["git", "add", "-A", "-N"], returncode=0, stdout="", stderr=""
+        )
         git_diff_result = subprocess.CompletedProcess(
             args=["git", "diff"], returncode=0, stdout="diff --git a/f", stderr=""
         )
         for desc, side_effect, return_value, expected_substr in self.CASES:
             with self.subTest(desc):
-                if side_effect:
-                    mock_run.side_effect = [git_diff_result, side_effect]
-                else:
-                    mock_run.side_effect = [git_diff_result, return_value]
+                claude_result = side_effect if side_effect else return_value
+                mock_run.side_effect = [git_add_result, git_diff_result, claude_result]
                 result = llm_validate({"alert_id": "test-1"}, Path("/tmp"))
                 self.assertTrue(result.passed, f"{desc}: should pass (flagged, not blocked)")
                 self.assertTrue(result.needs_review, f"{desc}: should flag for review")
@@ -1407,6 +1411,387 @@ class TestConfig(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 18. Gates judge what will actually be committed
+# ---------------------------------------------------------------------------
+
+def _git(args: list, cwd, check: bool = True):
+    """Run git in a test fixture with hooks and templates disabled.
+
+    The developer's global pre-commit hooks (Orca's own secret scanner among them)
+    would otherwise run on every fixture commit and dominate the suite's runtime.
+    """
+    return subprocess.run(
+        ["git", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir=", *args],
+        cwd=cwd, check=check, capture_output=True, text=True,
+    )
+
+
+def _init_repo(tmp: Path, files: dict) -> Path:
+    """Create a git repo on branch `main` with `files` committed. Returns its path."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    _git(["init", "-q", "-b", "main"], tmp)
+    _git(["config", "user.email", "t@test"], tmp)
+    _git(["config", "user.name", "test"], tmp)
+    for name, body in files.items():
+        (tmp / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp / name).write_text(body)
+    _git(["add", "-A"], tmp)
+    _git(["commit", "-qm", "init", "--no-verify"], tmp)
+    return tmp
+
+
+class TestDiffLineCount(unittest.TestCase):
+    """Table-driven: added+removed lines counted, file headers excluded."""
+
+    CASES = [
+        ("empty diff",        "",                                              0),
+        ("one addition",      "+++ b/f\n@@\n+new line\n",                      1),
+        ("one deletion",      "--- a/f\n@@\n-gone\n",                          1),
+        ("add and remove",    "--- a/f\n+++ b/f\n@@\n-old\n+new\n",            2),
+        ("headers only",      "--- a/f\n+++ b/f\n",                            0),
+        ("context ignored",   "+++ b/f\n@@\n unchanged\n+added\n",             1),
+        ("binary file",       "Binary files a/x and b/x differ\n",             0),
+    ]
+
+    def test_cases(self):
+        from validator import diff_line_count
+        for desc, diff_text, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(diff_line_count(diff_text), expected, desc)
+
+
+class TestWorktreeDiffSeesUntracked(unittest.TestCase):
+    """A fix that only creates files must not look like an empty diff.
+
+    Regression: gates read plain `git diff` (tracked+unstaged) while the commit
+    was `git add -A`, so newly created files were invisible to every gate yet
+    still committed.
+    """
+
+    CASES = [
+        # (description, files the fix agent writes, substrings expected in the diff)
+        ("modifies a tracked file", {"a.py": "x = 2\n"},           ["a.py"]),
+        ("creates a new file",      {"new.py": "SAFE = 1\n"},      ["new.py", "SAFE = 1"]),
+        ("both at once",            {"a.py": "x = 3\n",
+                                     "extra.py": "Y = 2\n"},       ["a.py", "extra.py"]),
+        ("creates a nested file",   {"pkg/mod.py": "Z = 3\n"},     ["pkg/mod.py"]),
+    ]
+
+    def test_cases(self):
+        from validator import worktree_diff
+        for desc, writes, expected_substrs in self.CASES:
+            with self.subTest(desc):
+                with tempfile.TemporaryDirectory() as td:
+                    repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+                    for name, body in writes.items():
+                        (repo / name).parent.mkdir(parents=True, exist_ok=True)
+                        (repo / name).write_text(body)
+                    diff = worktree_diff(repo)
+                    for substr in expected_substrs:
+                        self.assertIn(substr, diff, f"{desc}: '{substr}' missing from diff")
+
+    def test_no_changes_is_empty(self):
+        """A clean tree must still produce an empty diff — no false positives."""
+        from validator import worktree_diff
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            self.assertEqual(worktree_diff(repo).strip(), "")
+
+    def test_gitignored_files_excluded(self):
+        """Ignored artefacts must not enter the diff or the commit."""
+        from validator import worktree_diff
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n", ".gitignore": "junk/\n"})
+            (repo / "junk").mkdir()
+            (repo / "junk" / "cached.pyc").write_text("binary")
+            self.assertNotIn("junk", worktree_diff(repo))
+
+
+class TestSanityCheckFeatureType(unittest.TestCase):
+    """The diff-size limit follows the RESOLVED feature type.
+
+    Regression: package CVEs carry an empty raw feature_type (they are identified
+    by category), so sanity_check fell back to "sast" and applied a 50-line limit
+    to lockfile bumps that legitimately need 200.
+    """
+
+    # A package CVE as _normalize_alert() emits it: raw feature_type is empty.
+    PACKAGE_CVE = {"category": "Vulnerabilities", "feature_type": "",
+                   "labels": ["CVE-2023-44487"]}
+
+    CASES = [
+        # (description, alert, explicit feature_type, changed lines, expect_passed)
+        ("package CVE, 120 lines — under cve limit",
+         PACKAGE_CVE, "cve", 120, True),
+        ("package CVE, 120 lines — resolved from alert when not passed",
+         PACKAGE_CVE, None, 120, True),
+        ("package CVE, 300 lines — over cve limit",
+         PACKAGE_CVE, "cve", 300, False),
+        ("sast, 30 lines — under sast limit",
+         {"feature_type": "sast"}, "sast", 30, True),
+        ("sast, 120 lines — over sast limit",
+         {"feature_type": "sast"}, "sast", 120, False),
+        ("explicit type wins over alert contents",
+         {"feature_type": "sast"}, "cve", 120, True),
+    ]
+
+    def test_cases(self):
+        from validator import sanity_check
+        for desc, alert, ft, n_lines, expect_passed in self.CASES:
+            with self.subTest(desc):
+                with tempfile.TemporaryDirectory() as td:
+                    original = "\n".join(f"line{i}" for i in range(n_lines)) + "\n"
+                    repo = _init_repo(Path(td), {"deps.lock": original})
+                    # Rewrite every line: n additions + n deletions... so use half.
+                    changed = "\n".join(f"line{i}" for i in range(n_lines // 2))
+                    changed += "\n" + "\n".join(f"new{i}" for i in range(n_lines // 2)) + "\n"
+                    (repo / "deps.lock").write_text(changed)
+                    result = sanity_check(alert, repo, feature_type=ft)
+                    self.assertEqual(result.passed, expect_passed,
+                                     f"{desc}: failures={result.failures}")
+
+    def test_new_file_only_fix_passes(self):
+        """A fix whose whole change is a new file must reach the later gates."""
+        from validator import sanity_check
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            (repo / "safe_helper.py").write_text("def escape(s):\n    return s\n")
+            result = sanity_check({"feature_type": "sast"}, repo, feature_type="sast")
+            self.assertTrue(result.passed, f"failures={result.failures}")
+
+    def test_empty_diff_still_fails(self):
+        from validator import sanity_check
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            result = sanity_check({"feature_type": "sast"}, repo, feature_type="sast")
+            self.assertFalse(result.passed)
+            self.assertIn("empty", result.failures[0])
+
+
+# ---------------------------------------------------------------------------
+# 19. Worktree lifecycle — leaks, reclaim, guaranteed teardown
+# ---------------------------------------------------------------------------
+
+class TestWorktreePath(unittest.TestCase):
+    """Table-driven: worktree paths are namespaced per repo so runs cannot collide."""
+
+    CASES = [
+        # (description, repo, alert_id, expected path)
+        ("no repo",        None,                       "orca-1", "/tmp/orca-fix-orca-1"),
+        ("owner/repo",     Repository(name="acme/api", url=""),  "orca-1",
+         "/tmp/orca-fix-acme-api-orca-1"),
+        ("different repo, same alert", Repository(name="acme/web", url=""), "orca-1",
+         "/tmp/orca-fix-acme-web-orca-1"),
+    ]
+
+    def test_cases(self):
+        for desc, repo, alert_id, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(str(orchestrator._worktree_path(alert_id, repo)),
+                                 expected, desc)
+
+    def test_same_alert_in_two_repos_does_not_collide(self):
+        a = orchestrator._worktree_path("orca-9", Repository(name="acme/api", url=""))
+        b = orchestrator._worktree_path("orca-9", Repository(name="acme/web", url=""))
+        self.assertNotEqual(a, b)
+
+
+class TestBranchReclaim(unittest.TestCase):
+    """A leaked empty branch is reclaimable; one carrying commits is not."""
+
+    def test_empty_branch_is_reclaimable(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            _git(["branch", "fix/orca-1"], repo)
+            self.assertFalse(
+                orchestrator._branch_has_own_commits("fix/orca-1", str(repo)),
+                "a branch pointing at main has no commits of its own")
+
+    def test_branch_with_commits_is_protected(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            _git(["checkout", "-q", "-b", "fix/orca-1"], repo)
+            (repo / "human_work.py").write_text("important\n")
+            _git(["add", "-A"], repo)
+            _git(["commit", "-qm", "human work", "--no-verify"], repo)
+            _git(["checkout", "-q", "main"], repo)
+            self.assertTrue(
+                orchestrator._branch_has_own_commits("fix/orca-1", str(repo)),
+                "unmerged human work must never be force-deleted")
+
+    def test_unknown_branch_is_treated_as_having_commits(self):
+        """Fail safe: if we cannot inspect it, we do not delete it."""
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            self.assertTrue(
+                orchestrator._branch_has_own_commits("does/not/exist", str(repo)))
+
+    def test_local_branch_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n"})
+            _git(["branch", "fix/orca-1"], repo)
+            self.assertTrue(orchestrator._local_branch_exists("fix/orca-1", str(repo)))
+            self.assertFalse(orchestrator._local_branch_exists("fix/nope", str(repo)))
+
+
+class TestCreateWorktreeRecovery(unittest.TestCase):
+    """A leftover directory from a crashed run must not permanently skip an alert.
+
+    Regression: `git worktree add` failed with "already exists", run_one matched
+    that string and reported SKIPPED "branch already exists" on every later run.
+    """
+
+    def test_stale_directory_is_cleared(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root / "repo", {"a.py": "x = 1\n"})
+            stale = orchestrator._worktree_path("orca-stale",
+                                                Repository(name="acme/api", url=""))
+            shutil.rmtree(stale, ignore_errors=True)
+            stale.mkdir(parents=True)
+            (stale / "leftover.txt").write_text("from a crashed run\n")
+            try:
+                path = orchestrator._create_worktree(
+                    "orca-stale", "fix/orca-stale",
+                    repo=Repository(name="acme/api", url="", clone_path=repo))
+                self.assertTrue(path.exists(), "worktree should have been created")
+                self.assertFalse((path / "leftover.txt").exists(),
+                                 "stale contents should be gone")
+                self.assertTrue((path / "a.py").exists(),
+                                "worktree should contain the repo at BASE_BRANCH")
+            finally:
+                _git(["worktree", "remove", "--force", str(stale)], repo, check=False)
+                shutil.rmtree(stale, ignore_errors=True)
+
+    def test_branch_with_commits_raises_conflict(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            repo = _init_repo(root / "repo", {"a.py": "x = 1\n"})
+            _git(["checkout", "-q", "-b", "fix/orca-busy"], repo)
+            (repo / "wip.py").write_text("wip\n")
+            _git(["add", "-A"], repo)
+            _git(["commit", "-qm", "wip", "--no-verify"], repo)
+            _git(["checkout", "-q", "main"], repo)
+            with self.assertRaises(orchestrator.WorktreeConflict):
+                orchestrator._create_worktree(
+                    "orca-busy", "fix/orca-busy",
+                    repo=Repository(name="acme/api", url="", clone_path=repo))
+
+
+class TestWorktreeTeardownGuaranteed(unittest.TestCase):
+    """run_one must remove the worktree on every exit path, including exceptions."""
+
+    def _task(self):
+        return AlertTask(
+            alert_id="orca-td-1", title="Path Traversal", risk_level="high",
+            feature_type="sast", source="server.js:40",
+            alert_json={"alert_id": "orca-td-1", "feature_type": "sast"},
+        )
+
+    # (description, what the pipeline does, expected state)
+    CASES = [
+        ("fix agent fails",
+         lambda: FixAgentResult(success=False, failure_reason="no dice",
+                                error_code="fix_apply"),
+         "FAILED"),
+        ("fix agent times out",
+         lambda: FixAgentResult(success=False, timed_out=True,
+                                failure_reason="timed out", error_code="timeout"),
+         "TIMED_OUT"),
+    ]
+
+    def test_cleanup_on_failure_paths(self):
+        for desc, fix_factory, expected_state in self.CASES:
+            with self.subTest(desc):
+                with patch("orchestrator._create_worktree",
+                           return_value=Path("/tmp/orca-fix-fake")), \
+                     patch("orchestrator._remove_worktree") as mock_rm, \
+                     patch("orchestrator._invoke_fix_agent",
+                           return_value=fix_factory()), \
+                     patch("orchestrator._revert"):
+                    result = run_one(self._task(), dry_run=False,
+                                     notifier=MagicMock(),
+                                     repo=Repository(name="o/r", url=""))
+                self.assertEqual(result.state, expected_state, desc)
+                mock_rm.assert_called_once()
+
+    def test_cleanup_on_unexpected_exception(self):
+        """An exception mid-pipeline must still tear the worktree down."""
+        with patch("orchestrator._create_worktree",
+                   return_value=Path("/tmp/orca-fix-fake")), \
+             patch("orchestrator._remove_worktree") as mock_rm, \
+             patch("orchestrator._invoke_fix_agent",
+                   side_effect=OSError("disk exploded")):
+            with self.assertRaises(OSError):
+                run_one(self._task(), dry_run=False, notifier=MagicMock(),
+                        repo=Repository(name="o/r", url=""))
+        mock_rm.assert_called_once()
+
+    def test_cleanup_on_success(self):
+        with patch("orchestrator._create_worktree",
+                   return_value=Path("/tmp/orca-fix-fake")), \
+             patch("orchestrator._remove_worktree") as mock_rm, \
+             patch("orchestrator._invoke_fix_agent",
+                   return_value=FixAgentResult(success=True, diff_summary="ok")):
+            result = run_one(self._task(), dry_run=True, notifier=MagicMock(),
+                             repo=Repository(name="o/r", url=""))
+        self.assertEqual(result.state, "DONE")
+        mock_rm.assert_called_once()
+
+
+class TestWorktreeConflictClassification(unittest.TestCase):
+    """Table-driven: setup failures map to SKIPPED vs FAILED by exception type."""
+
+    CASES = [
+        # (description, exception raised by _create_worktree, expected state)
+        ("conflict → skipped",
+         orchestrator.WorktreeConflict("branch has commits"), "SKIPPED"),
+        ("other error → failed",
+         RuntimeError("could not clear stale worktree at /tmp/x"), "FAILED"),
+    ]
+
+    def test_cases(self):
+        for desc, exc, expected_state in self.CASES:
+            with self.subTest(desc):
+                task = AlertTask(
+                    alert_id="orca-c-1", title="T", risk_level="high",
+                    feature_type="sast", source="", alert_json={},
+                )
+                with patch("orchestrator._create_worktree", side_effect=exc), \
+                     patch("orchestrator._remove_worktree") as mock_rm:
+                    result = run_one(task, dry_run=False, notifier=MagicMock(),
+                                     repo=Repository(name="o/r", url=""))
+                self.assertEqual(result.state, expected_state, desc)
+                mock_rm.assert_not_called()  # nothing was created, nothing to remove
+
+
+class TestRevertClearsWorktree(unittest.TestCase):
+    """_revert must restore the tree fully, including files the agent created."""
+
+    def test_removes_new_files_and_restores_edits(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = _init_repo(Path(td), {"a.py": "x = 1\n", ".gitignore": "keep/\n"})
+            (repo / "keep").mkdir()
+            (repo / "keep" / "artifact.bin").write_text("expensive to rebuild")
+
+            (repo / "a.py").write_text("x = 999\n")          # modified
+            (repo / "created.py").write_text("junk\n")        # new
+            from validator import worktree_diff
+            worktree_diff(repo)                               # leaves intent-to-add entries
+
+            orchestrator._revert(repo)
+
+            self.assertEqual((repo / "a.py").read_text(), "x = 1\n",
+                             "tracked edit should be reverted")
+            self.assertFalse((repo / "created.py").exists(),
+                             "created file should be removed")
+            self.assertTrue((repo / "keep" / "artifact.bin").exists(),
+                            "gitignored artefacts must survive")
+            self.assertEqual(worktree_diff(repo).strip(), "",
+                             "tree should be clean after revert")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1438,6 +1823,15 @@ if __name__ == "__main__":
         TestLLMValidationErrors,
         TestOrcaCheckRetry,
         TestConfig,
+        TestDiffLineCount,
+        TestWorktreeDiffSeesUntracked,
+        TestSanityCheckFeatureType,
+        TestWorktreePath,
+        TestBranchReclaim,
+        TestCreateWorktreeRecovery,
+        TestWorktreeTeardownGuaranteed,
+        TestWorktreeConflictClassification,
+        TestRevertClearsWorktree,
     ]
 
     for cls in test_classes:
