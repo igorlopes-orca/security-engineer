@@ -166,6 +166,12 @@ class TestGenericPipelineIsUnchanged(unittest.TestCase):
         self.assertEqual(p.timeout_sec, TIMEOUTS["cve"])
         self.assertEqual(p.diff_limit, _DIFF_LIMITS["cve"])
 
+    def test_fallback_timeout_table_matches_the_orchestrator(self):
+        """pipelines._DEFAULT_TIMEOUTS is only used by direct callers, so drift
+        would go unnoticed until a tool disagreed with a real run."""
+        import pipelines
+        self.assertEqual(pipelines._DEFAULT_TIMEOUTS, TIMEOUTS)
+
     def test_unknown_type_falls_back_to_the_old_defaults(self):
         p = get_pipeline("mystery", timeouts=TIMEOUTS)
         self.assertEqual(p.timeout_sec, 180, "the pre-existing default")
