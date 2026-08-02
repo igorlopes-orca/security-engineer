@@ -19,6 +19,8 @@ from orca_client import (
     is_fixable, alert_branch_name, branch_exists_remote,
     RISK_ORDER, _resolve_feature_type
 )
+from version_data import (ecosystem_for_manifest, resolve_bump,
+                          resolve_ecosystem)
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +169,31 @@ def cmd_get_alert(args):
     print(json.dumps(alert, indent=2))
 
 
+def cmd_resolve_version(args):
+    """Print the version decision for one package as JSON.
+
+    Deliberately usable on its own, with no Orca token and no alert: the version
+    choice is the part of a CVE fix a reviewer most needs to be able to check,
+    and "run this one command" beats reproducing a whole pipeline run.
+
+    The ecosystem argument also accepts a manifest path, so an alert's `source`
+    field can be pasted in directly.
+    """
+    eco = resolve_ecosystem(args.ecosystem) or ecosystem_for_manifest(args.ecosystem)
+    if eco is None:
+        print(json.dumps({"error": f"unknown ecosystem or manifest: "
+                                   f"{args.ecosystem!r}"}))
+        sys.exit(1)
+
+    kwargs = {"offline": args.offline}
+    if args.cache_ttl is not None:      # None means "leave the default alone"
+        kwargs["cache_ttl_sec"] = args.cache_ttl
+    decision = resolve_bump(eco, args.package, args.current, **kwargs)
+    print(json.dumps(decision.to_dict(), indent=2))
+    if decision.error:
+        sys.exit(1)
+
+
 def cmd_git_setup(args):
     branch = alert_branch_name(args.alert_id)
 
@@ -252,6 +279,19 @@ def main():
     p_get = sub.add_parser("get-alert", help="Fetch single alert as JSON")
     p_get.add_argument("alert_id")
 
+    # resolve-version — no Orca token needed
+    p_ver = sub.add_parser("resolve-version",
+                           help="Which version fixes a vulnerable package (JSON)")
+    p_ver.add_argument("ecosystem",
+                       help="pypi|npm|go|maven|cargo|rubygems|nuget, "
+                            "or a manifest path such as ./app/requirements.txt")
+    p_ver.add_argument("package")
+    p_ver.add_argument("current", help="Currently installed version")
+    p_ver.add_argument("--offline", action="store_true",
+                       help="Serve from cache only; never call OSV or deps.dev")
+    p_ver.add_argument("--cache-ttl", type=int, default=None,
+                       help="Cache lifetime in seconds (default 6h; 0 forces a refetch)")
+
     # git-setup
     p_git = sub.add_parser("git-setup", help="Create fix branch from main")
     p_git.add_argument("alert_id")
@@ -276,6 +316,7 @@ def main():
     dispatch = {
         "list-alerts": cmd_list_alerts,
         "get-alert":   cmd_get_alert,
+        "resolve-version": cmd_resolve_version,
         "git-setup":   cmd_git_setup,
         "git-commit":  cmd_git_commit,
         "open-pr":     cmd_open_pr,

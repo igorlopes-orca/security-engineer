@@ -3,9 +3,11 @@ PLUGIN_CACHE := $(HOME)/.claude/plugins/cache/orca-security/security-engineer/$(
 
 .PHONY: test e2e all install validate reset run observe loop fast
 
-# Unit tests — no API token needed, pure Python
+# Unit tests — no API token needed, no network, pure Python
 test:
 	python3 skills/security-engineer/tests/test_orchestrator.py
+	python3 skills/security-engineer/tests/test_version_data.py
+	python3 skills/security-engineer/tests/test_package_identity.py
 	python3 devloop/tests/test_observe.py
 
 # Integration tests — requires ORCA_API_TOKEN
