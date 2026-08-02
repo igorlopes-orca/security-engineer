@@ -1,21 +1,33 @@
 # security-engineer
 
-A Claude Code plugin that autonomously remediates Orca security alerts — from detection to merged PR.
+A Claude Code plugin that autonomously remediates Orca security alerts — from
+alert to reviewable pull request.
 
 ## What it does
 
-Fetches open Orca alerts, then for each one: creates an isolated git branch, invokes a Claude subprocess to apply the fix, runs a 4-phase validation chain, assesses production impact, opens a PR with the impact summary, and notifies via console, log, and optional webhook.
+Fetches open Orca alerts, then for each one: creates an isolated git worktree,
+decides the fix target from advisory data where it can, invokes a Claude
+subprocess to apply the change, runs it through five gates, assesses production
+impact, opens a PR carrying that assessment, and notifies.
 
 ```
 Orca alerts
-    └─► [for each alert, parallel]
-            create worktree
-                └─► fix agent (Claude)
-                        └─► validate: sanity → LLM → build → CI
-                                └─► impact agent (Claude)
-                                        └─► commit → PR → notify
-    └─► summary table
+    └─► [for each alert, up to 4 in parallel]
+            isolated worktree
+                └─► resolve target version (CVE only, from OSV + deps.dev)
+                        └─► fix agent (Claude)
+                                └─► gates: sanity → LLM → type verify
+                                        └─► impact agent → commit → PR
+                                                └─► gates: Orca check → CI
+    └─► summary table, non-zero exit if anything failed
 ```
+
+Nothing is merged automatically. Every run ends at an open PR with an impact
+label, a version rationale, and a `needs-review` flag wherever a gate passed
+without being able to confirm.
+
+**How and why it holds together — the gates, the data sources, what fails open
+and what fails closed: [`HARNESS.md`](HARNESS.md).**
 
 ## Installation
 
@@ -23,7 +35,7 @@ Orca alerts
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v1.0.33+
 - [GitHub CLI](https://cli.github.com/) (`gh`) — authenticated
-- Python 3.10+
+- Python 3.10+ (3.11+ for TOML manifests)
 - An [Orca Security](https://orca.security/) API token
 
 ### Install the plugin
@@ -75,6 +87,8 @@ convenience layer on top of them.
 /security-engineer:script --scan --remote all          → list risks across all repos
 ```
 
+`--scan` is read-only and rejects `--dry-run`, `--alert` and `--max`.
+
 ### Shell — the same flags, outside Claude Code
 
 Installing the plugin puts `security-engineer` on your `PATH`, so every example
@@ -84,6 +98,9 @@ above also works in a terminal, a Makefile, or CI:
 security-engineer high,cve --max 3
 security-engineer --scan --remote all
 ```
+
+The exit code is meaningful: non-zero if any alert failed, timed out, or landed
+with red CI.
 
 ### Plain English — translated to those same flags
 
@@ -105,6 +122,32 @@ or a bare `192901290` all resolve to Orca's `orca-192901290`. If a message
 contains explicit flags, they are passed through untouched rather than
 re-interpreted.
 
+### Filters
+
+A filter is one positional token: severity and type joined by a comma, no
+spaces. Severity is cumulative (`high` means critical *and* high); type is
+exact.
+
+| | Tokens |
+|---|---|
+| **Severity** | `critical` · `high` · `medium` · `low` |
+| **Type** | `cve` (package/dependency) · `sast` · `iac` · `secret` |
+
+## Coverage
+
+| Finding type | What the fix is | Post-fix check |
+|---|---|---|
+| `cve` | A manifest version bump, target resolved before the agent runs | Manifest pins the resolved version, lockfile agrees, applied version carries no known advisory, plus `go build` / `cargo metadata` where available |
+| `sast` | A code change | Language build check |
+| `iac` | Dockerfile / Kubernetes / Terraform change | `terraform validate`, or skipped |
+| `secret` | Credential removed and externalised | Build check, plus a sanity gate rejecting any newly added secret-shaped line |
+
+CVE ecosystems: PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet.
+Build checks: Go, JavaScript/TypeScript, Python, Terraform — a missing
+toolchain skips the check rather than failing it.
+
+`scm_posture` findings are reported as needing manual action and never fixed.
+
 ## CVE version decisions
 
 For a package CVE the target version is resolved before the fix agent runs, from
@@ -124,72 +167,72 @@ Inspect any decision without a token, an alert, or a pipeline run:
 python3 skills/run/run_agent.py resolve-version pypi pillow 8.3.1
 ```
 
-Ecosystems: PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet. See
-`skills/run/SKILL.md` for the `version_data:` config keys.
+The same rationale, cleared advisories and reproduce command land in the PR body.
+Details in [`HARNESS.md`](HARNESS.md#the-version-decision).
 
-## Language coverage
+## Configuration
 
-Each finding type runs through a pipeline (`skills/run/pipelines/`)
-that owns its own post-fix check.
-
-**CVE:** the manifest must pin the resolved version, a lockfile beside it must
-agree, and the applied version must carry no known advisory. Plus `go build ./...`
-(Go) or `cargo metadata --locked` (Cargo) where the toolchain is present.
-
-**sast / iac / secret:** a local build check, with the build root detected from the
-alert's source file path (from Orca), so subdirectory apps and monorepos are
-handled correctly.
-
-| Language | Build check | Root detection |
-|---|---|---|
-| Go | `go build ./...` | walks up to nearest `go.mod` |
-| JavaScript / TypeScript | `npm run build --if-present` | walks up to nearest `package.json` |
-| Python | `python3 -m py_compile` per file | per-file, no root needed |
-| Terraform | `terraform validate` | directory of the changed `.tf` file |
-| Other (YAML, Dockerfile, …) | skipped | — |
-
-If the build tool isn't installed the check is skipped (not failed) — the Orca
-check and CI gates catch regressions.
-
-## Plugin layout
-
-```
-.claude-plugin/plugin.json   → plugin manifest
-bin/security-engineer        → CLI entry point (plugin bin/ is added to PATH)
-commands/script.md           → /security-engineer:script slash command
-skills/
-  run/                       → /security-engineer:run skill — orchestrator, validator,
-                               agents, notifier. The directory name is the skill name.
-    fix-agents/              → fix instructions per vulnerability type (cve, sast, iac, secret)
-  lib/                       → shared Orca API client
-docs/                        → design plans
-examples/                    → usage examples
-```
-
-## Environment variables
+Secrets live in the environment:
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ORCA_API_TOKEN` | Yes | Orca API token (base64 string from Orca config) |
+| `ORCA_API_TOKEN` | Yes | Orca API token (base64 string from Orca config). `ORCA_AUTH_TOKEN` is accepted as an alias |
 | `NOTIFY_WEBHOOK_URL` | No | Webhook URL for Slack/Teams notifications |
+| `SECURITY_ENGINEER_CONFIG` | No | Path to a YAML file overriding gate and data-layer settings |
+
+Everything else — gate timeouts, retry policy, the Orca check name, the version
+data cache, concurrency caps — is YAML. The keys and their defaults are tabled in
+[`HARNESS.md`](HARNESS.md#configuration).
+
+## Repository layout
+
+```
+.claude-plugin/              plugin manifest and marketplace definition
+bin/security-engineer        CLI entry point (plugin bin/ is added to PATH)
+commands/script.md           /security-engineer:script — flags, verbatim
+skills/
+  run/                       /security-engineer:run — the orchestrator lives here.
+                             The directory name is the skill name.
+    orchestrator.py            state machine: fetch → fix → gate → PR → notify
+    validator.py               the gates
+    pipelines/                 per-finding-type prepare()/verify() specialists
+    impact_agent.py            production risk assessment
+    notifier.py                console / NDJSON log / webhook backends
+    run_agent.py               mechanical ops CLI (alerts, git, PR, resolve-version)
+    fix-agents/                fix instructions per type, and per CVE ecosystem
+    tests/                     unit suites
+  lib/
+    orca_client.py             Orca API client
+    version_data.py            OSV + deps.dev version-decision layer
+HARNESS.md                   how the harness works and why
+devloop/                     live-run test harness — not shipped with the plugin
+docs/                        design plans
+```
 
 ## Developing
 
-Unit tests cover argument parsing and mocked branches; the pipeline that matters
-— worktree lifecycle, what the validation gates actually see, whether the Orca
-check gate fires — only exists in a live run. `devloop/` makes that one command:
+```bash
+make test                              # 366 unit tests, no token or network
+make fast                              # test → install → reset sandbox → fix one alert → report
+make loop ARGS="--dry-run cve"         # plan only, no writes
+make loop ARGS="sast --max 2"          # any orchestrator filter
+```
+
+Unit tests cover argument parsing, version ordering, manifest parsing and gate
+behaviour on mocked diffs. The pipeline that matters — worktree lifecycle, what
+the gates actually see, whether the Orca check gate fires — only exists in a live
+run, and `devloop/` makes that one command:
 
 ```bash
-cp devloop/.env.example devloop/.env   # fill in ORCA_API_TOKEN
-make test                               # unit tests, no token or network
-make fast                               # test → reset sandbox → fix one alert → report
-make loop ARGS="--dry-run cve"          # plan only, no writes
+cp devloop/.env.example devloop/.env   # then fill in ORCA_API_TOKEN
 ```
 
 `make fast` runs the orchestrator against a disposable sandbox repo and prints
 per-alert state, PR URLs, Orca check conclusions, and the annotations behind any
-failure. See [`devloop/README.md`](devloop/README.md). Nothing in `devloop/` ships
-with the plugin.
+failure. See [`devloop/README.md`](devloop/README.md).
+
+New functions and behaviours need table-driven tests — a `CASES` list looped with
+`self.subTest`, per [`CLAUDE.md`](CLAUDE.md).
 
 ### Running your working tree as the plugin
 
