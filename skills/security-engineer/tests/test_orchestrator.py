@@ -8,6 +8,7 @@ Verifies that argument parsing, filter logic, and flag enforcement
 Run with: python3 tests/test_orchestrator.py
 No API token or network access required — all tests are pure Python.
 """
+import inspect
 import shutil
 import subprocess
 import sys
@@ -443,12 +444,15 @@ class TestDryRunEnforcement(unittest.TestCase):
         """run_one must return task with state DONE after fix plan, without touching git."""
         task = self._make_task()
 
+        # Phase 3 runs through FixPipeline.verify() now, so local_build_check is
+        # patched in pipelines.base — where the call actually happens — rather
+        # than in the orchestrator module, which no longer calls it.
         with patch("orchestrator._create_worktree", return_value=Path("/tmp/fake")), \
              patch("orchestrator._remove_worktree"), \
              patch("orchestrator._invoke_fix_agent") as mock_fix, \
              patch("orchestrator.sanity_check") as mock_sanity, \
              patch("orchestrator.llm_validate") as mock_llm, \
-             patch("orchestrator.local_build_check") as mock_build, \
+             patch("pipelines.base.local_build_check") as mock_build, \
              patch("orchestrator._commit_and_pr") as mock_commit:
 
             mock_fix.return_value = FixAgentResult(success=True, diff_summary="planned fix")
@@ -1126,12 +1130,16 @@ class TestBuildPromptContext(unittest.TestCase):
 class TestImpactAnalysisErrors(unittest.TestCase):
     """Verify that analyze_impact() captures and surfaces error details."""
 
+    # Derived from the function's own default so raising the budget does not
+    # break the test that only cares that a timeout is surfaced at all.
+    _TIMEOUT = inspect.signature(analyze_impact).parameters["timeout_sec"].default
+
     CASES = [
         (
             "timeout returns error field",
-            subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+            subprocess.TimeoutExpired(cmd=["claude"], timeout=_TIMEOUT),
             None,  # no CompletedProcess
-            "timeout after 90s",
+            f"timeout after {_TIMEOUT}s",
         ),
         (
             "non-zero exit stores stderr",
@@ -1250,7 +1258,7 @@ class TestOrcaCheckRetry(unittest.TestCase):
     @patch("orchestrator._get_diff", return_value="diff --git a/server.js")
     @patch("orchestrator.ci_gate")
     @patch("orchestrator.orca_check_gate")
-    @patch("orchestrator.local_build_check")
+    @patch("pipelines.base.local_build_check")
     @patch("orchestrator.llm_validate")
     @patch("orchestrator.sanity_check")
     @patch("orchestrator._revert")
@@ -1314,7 +1322,7 @@ class TestOrcaCheckRetry(unittest.TestCase):
     @patch("orchestrator._get_diff", return_value="diff --git a/server.js")
     @patch("orchestrator.ci_gate")
     @patch("orchestrator.orca_check_gate")
-    @patch("orchestrator.local_build_check")
+    @patch("pipelines.base.local_build_check")
     @patch("orchestrator.llm_validate")
     @patch("orchestrator.sanity_check")
     @patch("orchestrator._revert")

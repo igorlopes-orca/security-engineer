@@ -128,27 +128,45 @@ Run `python3 ${CLAUDE_SKILL_DIR}/tests/test_orchestrator.py` to verify all flags
 
 Operates on the repo you're already inside — no cloning.
 
+Each finding type runs through a **FixPipeline** (`pipelines/`) that owns its
+timeout, diff budget, pre-fix `prepare()` and post-fix `verify()`. `cve` has a
+specialist; `sast`, `iac` and `secret` use the generic pipeline, which behaves
+exactly as the orchestrator did before pipelines existed.
+
 ```
 For each alert (up to 4 in parallel, isolated git worktree per alert):
 
   1. create_worktree        -> /tmp/orca-fix-<owner>-<repo>-<id>  (isolated branch)
                               clears leftovers from a crashed run; refuses to
                               delete a branch holding commits (skips instead)
-  2. invoke_fix_agent       -> claude subprocess, --allowedTools Read,Edit,Write,Bash
-                              timeout: sast=180s, iac/secret=120s, cve=240s
+  2. pipeline.prepare       -> Phase 0. CVE only: resolve the package and the
+                              target version from OSV + deps.dev (see CVE
+                              Version Decisions). A failure here is not fatal —
+                              the fix proceeds unguided, flagged needs-review.
+  3. invoke_fix_agent       -> claude subprocess, --allowedTools Read,Edit,Write,Bash
+                              timeout from the pipeline (sast=180s,
+                              iac/secret=120s, cve=240s)
+                              prompt = fix-agents/<type>.md + prepare() directive
                               retries: up to 2 on json_parse / subprocess errors
-  3. validate (Phase 1)     -> Python: diff non-empty, diff size, no new secrets
+  4. validate (Phase 1)     -> Python: diff non-empty, diff size, no new secrets,
+                              and the agent's diff_summary must not name a
+                              version its own diff never added
                               diff = `git add -A -N` + `git diff`, so created
-                              files count; size limit keyed on resolved type
-  4. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
-  5. validate (Phase 3)     -> Local build (see Language Coverage below)
-  6. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
-  7. git-commit             -> run_agent.py git-commit
-  8. open-pr                -> run_agent.py open-pr (includes impact in PR body)
-  9. validate (Phase 4)     -> Orca check gate (see Orca Check Gate below)
- 10. validate (Phase 5)     -> CI gate: gh pr checks --watch (timeout: 10min)
- 11. notify                 -> console + log file (+ webhook if configured)
- 12. remove_worktree        -> cleanup worktree + local branch (runs in a finally,
+                              files count; size limit from the pipeline
+  5. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
+  6. pipeline.verify        -> Phase 3. CVE: the manifest actually pins the
+                              resolved version, the lockfile agrees, and the
+                              applied version carries no known advisory.
+                              Other types: local build (see Language Coverage)
+  7. impact_agent           -> claude subprocess: diff + the resolved bump
+                              distance -> production risk JSON
+  8. git-commit             -> run_agent.py git-commit
+  9. open-pr                -> run_agent.py open-pr (impact + version rationale
+                              in the PR body)
+ 10. validate (Phase 4)     -> Orca check gate (see Orca Check Gate below)
+ 11. validate (Phase 5)     -> CI gate: gh pr checks --watch (timeout: 10min)
+ 12. notify                 -> console + log file (+ webhook if configured)
+ 13. remove_worktree        -> cleanup worktree + local branch (runs in a finally,
                               so it happens on every exit path incl. exceptions)
 ```
 
@@ -192,7 +210,9 @@ times. After retries are exhausted, behavior follows `on_failure` (`retry`/`fail
 - Check concludes `success` or `neutral`
 - Check `skipped` or not found after the grace period → passes, flagged `needs-review`
 
-**Configuration** (`config.py`, overridable via `SECURITY_ENGINEER_CONFIG` YAML):
+**Configuration** (`orca_check:` section of `config.py`, overridable via
+`SECURITY_ENGINEER_CONFIG` YAML — see also `version_data:` under CVE Version
+Decisions):
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -207,9 +227,74 @@ times. After retries are exhausted, behavior follows `on_failure` (`retry`/`fail
 **Environment:** Relies on `gh` being authenticated for the target repo; no `orca-cli`
 binary or API token is needed on the runner.
 
+## CVE Version Decisions
+
+For a package CVE, the target version is resolved **before** the fix agent runs,
+by `skills/lib/version_data.py`. The agent is told which version to apply rather
+than asked to work it out.
+
+**Sources** (both free, unauthenticated, and cached on disk):
+
+| Source | Supplies |
+|---|---|
+| OSV.dev `POST /v1/query` | advisory ranges — which versions each advisory affects |
+| deps.dev v3 | which versions were actually published |
+
+**Policy: minimum safe at any distance.** The target is the lowest published
+release that clears *every* advisory affecting the installed version — queried
+package-wide, not just for the alert's own CVE, so a bump cannot land on a
+different known vulnerability. Crossing a major boundary is not refused, because
+some packages have no safe release inside the current major; instead the distance
+is classified (`bump_class`, `majors_crossed`) and handed to impact analysis.
+
+**Ecosystems:** PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet. The ecosystem comes
+from the manifest filename in the alert's `source`; the package name is whichever
+manifest entry the alert's prose names, cross-checked against the manifest, which
+is the authority. Per-ecosystem agent instructions live in `fix-agents/cve/`.
+
+**Inspect a decision by hand** — no Orca token or alert needed:
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/run_agent.py resolve-version pypi pillow 8.3.1
+python3 ${CLAUDE_SKILL_DIR}/run_agent.py resolve-version ./app/requirements.txt requests 2.20.0
+```
+
+The same rationale, cleared advisories and reproduce command appear in the PR body.
+
+**Configuration** (`version_data:` section):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false` reverts CVEs to the generic pipeline entirely |
+| `cache_dir` | `~/.cache/security-engineer/version-data` | On-disk cache location |
+| `cache_ttl_sec` | `21600` (6h) | Cache lifetime; `0` forces a refetch |
+| `timeout_sec` | `20` | Per-request HTTP timeout |
+| `offline` | `false` | Serve from cache only; never call out |
+| `osv_url` / `deps_dev_url` | upstream defaults | Override the endpoints |
+
+**Degradation:** every failure — unknown ecosystem, unparsed manifest, API
+outage, no safe version — leaves the fix running on the agent's own judgement
+with the alert flagged `needs-review`. A data-layer problem costs determinism,
+not the fix.
+
 ## Language Coverage
 
-Phase 3 (local build) runs a language-appropriate check after each fix. The build root is detected by walking up from the affected file — the path comes from the Orca alert (`source` field), so monorepos and subdirectory apps are handled correctly.
+Phase 3 is the type's `pipeline.verify()`.
+
+**CVE** does not use the build-command table below. A dependency bump touches
+manifests and lockfiles, whose extensions (`.txt`, `.mod`, `.json`) never matched
+any entry, so this table silently did nothing for CVE fixes. Instead the CVE
+pipeline asserts the manifest pins the resolved version, that a lockfile beside it
+agrees, and that the applied version carries no known advisory — then runs an
+ecosystem resolve check where one is cheap and offline (`go build ./...` for Go,
+`cargo metadata --locked` for Cargo). `pip install` / `npm install` / `mvn` are
+deliberately not run: they are slow, need the network, and rewrite lockfiles,
+which is the fix agent's job. CI covers what is left.
+
+**sast / iac / secret** use the generic pipeline, which runs the language check
+below. The build root is detected by walking up from the affected file — the path
+comes from the Orca alert (`source` field), so monorepos and subdirectory apps are
+handled correctly.
 
 | Language | Detection | Build command | Notes |
 |---|---|---|---|
@@ -219,7 +304,8 @@ Phase 3 (local build) runs a language-appropriate check after each fix. The buil
 | Terraform | directory of `.tf` file | `terraform validate` | Skipped if `terraform` not installed |
 | Dockerfile / YAML / other | — | skipped | No build check |
 
-If the build tool is not installed, the check passes (skip, not fail) — CI in Phase 4 catches regressions.
+If the build tool is not installed, the check passes (skip, not fail) — the Orca
+check and CI gates catch regressions.
 
 ## Notifications
 
