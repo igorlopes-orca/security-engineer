@@ -4,7 +4,7 @@ PLUGIN      := security-engineer@$(MARKETPLACE)
 ORIGIN      := igorlopes-orca/security-engineer
 PLUGIN_CACHE := $(HOME)/.claude/plugins/cache/orca-security/security-engineer/$(VERSION)
 
-.PHONY: test e2e all install uninstall plugin-status validate reset run observe loop fast
+.PHONY: test lint e2e all install uninstall plugin-status validate reset run observe loop fast
 
 # Unit tests — no API token needed, no network, pure Python
 test:
@@ -14,6 +14,24 @@ test:
 	python3 skills/run/tests/test_pipelines.py
 	python3 devloop/tests/test_observe.py
 	python3 devloop/tests/test_plugin_sync.py
+	python3 tools/tests/test_check_manifests.py
+
+# Static checks. CI (.github/workflows/ci.yml) runs this exact target, so a
+# green PR is predictable from here rather than discovered on the pull request.
+#
+# Needs the two linters on PATH; CI pins the same versions:
+#   pip install ruff==0.16.1 shellcheck-py==0.11.0.1
+#
+# shellcheck is pointed at the four scripts that are executed, not at
+# config.sh — that one only defines variables for its two sourcers, so checked
+# on its own every definition reads as unused. `-x --source-path=SCRIPTDIR`
+# makes shellcheck follow the `source` line and check it in the context that
+# uses it.
+lint:
+	ruff check .
+	shellcheck -x --source-path=SCRIPTDIR \
+	  install.sh bin/security-engineer devloop/run.sh devloop/reset.sh
+	python3 tools/check_manifests.py
 
 # Integration tests — requires ORCA_API_TOKEN
 e2e:
