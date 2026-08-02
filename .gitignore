@@ -1,9 +1,14 @@
 **/__pycache__/
 *.py[cod]
 
-# Local Claude Code config
-.claude/
+# Local Claude Code config — but share the dev-loop runbook with the team
+.claude/*
+!.claude/commands/
 
 # Runtime logs
 security-engineer-run.json
 skills/security-engineer/security-engineer-run.json
+
+# Dev loop — captured runs and local secrets
+devloop/runs/
+devloop/.env

@@ -1,0 +1,43 @@
+# Dev-loop config, passed to the orchestrator via SECURITY_ENGINEER_CONFIG.
+# Loaded by config.py:load_config(). Requires PyYAML; without it config.py
+# warns and falls back to defaults (run.sh checks and tells you).
+#
+# This file exists so the loop exercises the real Phase 4 path quickly. It does
+# NOT change what ships — the defaults in skills/security-engineer/config.py
+# are untouched.
+
+orca_check:
+  enabled: true
+
+  # The Orca GitHub App posts several checks per PR, named
+  # "Orca Security - SAST", "Orca Security - Vulnerabilities",
+  # "Orca Security - IaC", "Orca Security - Secrets", "Orca Security - OSS Licenses".
+  # The shipped default ("orca-security-us") matches none of them as a
+  # substring, so the gate silently takes the on_not_found path. Matching on
+  # the common prefix is what makes the gate actually run here.
+  check_name: "Orca Security"
+
+  # Tighter than the 600s/15s defaults — an iteration should finish in minutes.
+  timeout_sec: 300
+  poll_interval_sec: 10
+
+  # One retry is enough to see whether annotation feedback reaches the fix
+  # agent; more just makes iterations slow.
+  max_retries: 1
+  on_failure: retry
+
+  # Match production. "fail" is tempting — a missing check means the gate did
+  # nothing — but it is the wrong lever twice over: re-running the fix agent
+  # cannot make a GitHub App appear, so the retry is pure waste, and it turns an
+  # environmental problem into a red run that looks like a code regression.
+  # observe.py already prints "(no Orca checks on this commit)" for this case,
+  # which is the visibility that was actually wanted.
+  #
+  # As of 2026-08-01 the Orca App posts nothing on igorlopes-orca/vulnerable-apps
+  # (it posted five checks there in April), so Phase 4 cannot be exercised
+  # end-to-end until that integration is reconnected.
+  on_not_found: skip
+
+# Keep concurrency low so console output stays readable when reading a run.
+max_parallel_fixes: 2
+max_parallel_repos: 1
