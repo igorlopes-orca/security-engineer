@@ -1,5 +1,5 @@
 ---
-name: security-engineer
+name: run
 description: Remediate Orca Security alerts end to end — fix, validate, assess production impact, open a PR, notify. Use whenever someone asks to fix, remediate, patch, triage, or scan security alerts, vulnerabilities, or findings, whether they name a severity ("remediate all high vulnerabilities", "patch the critical ones"), a type ("fix the SAST issues", "clean up the hardcoded secrets", "bump the vulnerable dependencies", "fix the Dockerfile findings"), a count ("just one", "max of 3"), an alert ID ("remediate alert-192901290", "fix orca-4060720"), or a repo ("fix everything in owner/repo", "scan all our repos"). Also covers dry runs and read-only risk reports. Covers CVE/SCA, SAST, IaC, and secret findings.
 argument-hint: "[risk_levels,feature_types] [--scan] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
 allowed-tools: Bash
@@ -17,7 +17,7 @@ There are two ways in, and they end at the same command:
 
 | The user typed | What you do |
 |---|---|
-| Flags — `/security-engineer:run high,cve --max 3`, or any message containing `--scan`, `--dry-run`, `--alert`, `--max`, `--remote`, or a bare filter token like `high,cve` | **Pass them through verbatim.** Do not re-derive, reorder, add, or drop a single flag. |
+| Flags — `/security-engineer:script high,cve --max 3`, or any message containing `--scan`, `--dry-run`, `--alert`, `--max`, `--remote`, or a bare filter token like `high,cve` | **Pass them through verbatim.** Do not re-derive, reorder, add, or drop a single flag. |
 | Plain English — "remediate all high vulnerabilities with max of 3" | Translate with the tables in §1. |
 
 If a message mixes both — "fix the high CVEs, `--dry-run`" — the explicit flag is
@@ -36,7 +36,7 @@ security-engineer [FILTER] [FLAGS]
 installed: say so and stop. Do not go hunting for `orchestrator.py`.
 
 It takes exactly the flags documented in the Usage Reference below, so anything
-valid after `/security-engineer:run` is valid after `security-engineer`.
+valid after `/security-engineer:script` is valid after `security-engineer`.
 
 **FILTER** is a single positional token: severity and type joined by a comma,
 no spaces (`high`, `cve`, `high,cve`, `critical,sast`). Severity is cumulative —
@@ -123,7 +123,7 @@ Three interchangeable entry points, one flag grammar — this reference applies 
 all three:
 
 ```
-/security-engineer:run high,cve --max 3     # slash command
+/security-engineer:script high,cve --max 3     # slash command
 security-engineer high,cve --max 3          # shell, or what this skill runs
 "fix up to 3 high CVEs"                     # plain English, translated per §1
 ```
@@ -132,35 +132,35 @@ security-engineer high,cve --max 3          # shell, or what this skill runs
 
 ```
 # Local mode — operates on the repo you're already inside
-/security-engineer:run                             -> all fixable alerts, all severities
-/security-engineer:run cve                         -> CVE alerts only, all severities
-/security-engineer:run high                        -> high+ severity, all types
-/security-engineer:run high,cve                    -> high+ severity AND CVE type only
-/security-engineer:run critical,sast               -> critical+ AND SAST only
-/security-engineer:run --dry-run cve               -> plan CVE fixes — read-only, no git ops
-/security-engineer:run --dry-run high,sast         -> plan high+ SAST fixes — no edits
-/security-engineer:run --alert orca-270453         -> fix one specific alert (live)
-/security-engineer:run --alert orca-270453 --dry-run -> plan one specific alert
-/security-engineer:run --max 3 cve                 -> cap at 3 CVE fixes
+/security-engineer:script                             -> all fixable alerts, all severities
+/security-engineer:script cve                         -> CVE alerts only, all severities
+/security-engineer:script high                        -> high+ severity, all types
+/security-engineer:script high,cve                    -> high+ severity AND CVE type only
+/security-engineer:script critical,sast               -> critical+ AND SAST only
+/security-engineer:script --dry-run cve               -> plan CVE fixes — read-only, no git ops
+/security-engineer:script --dry-run high,sast         -> plan high+ SAST fixes — no edits
+/security-engineer:script --alert orca-270453         -> fix one specific alert (live)
+/security-engineer:script --alert orca-270453 --dry-run -> plan one specific alert
+/security-engineer:script --max 3 cve                 -> cap at 3 CVE fixes
 
 # Remote mode — clones repos, runs full pipeline, cleans up
-/security-engineer:run --remote owner/repo              -> clone owner/repo, fix all alerts
-/security-engineer:run --remote owner/repo high,cve     -> clone, fix high+ CVEs only
-/security-engineer:run --remote --dry-run owner/repo    -> clone, plan only, no edits
-/security-engineer:run --remote all                     -> all Orca-discovered repos (clone each)
-/security-engineer:run --remote all high,cve            -> all repos, high+ CVEs only
-/security-engineer:run --remote all --dry-run sast      -> plan SAST fixes across all repos
-/security-engineer:run --remote all --max 2 cve         -> cap at 2 CVE fixes per repo
+/security-engineer:script --remote owner/repo              -> clone owner/repo, fix all alerts
+/security-engineer:script --remote owner/repo high,cve     -> clone, fix high+ CVEs only
+/security-engineer:script --remote --dry-run owner/repo    -> clone, plan only, no edits
+/security-engineer:script --remote all                     -> all Orca-discovered repos (clone each)
+/security-engineer:script --remote all high,cve            -> all repos, high+ CVEs only
+/security-engineer:script --remote all --dry-run sast      -> plan SAST fixes across all repos
+/security-engineer:script --remote all --max 2 cve         -> cap at 2 CVE fixes per repo
 ```
 
 ### Scan mode — list risks without fixing
 
 ```
-/security-engineer:run --scan                           -> list all risks, local repo
-/security-engineer:run --scan high                      -> list high+ risks only
-/security-engineer:run --scan sast,iac                  -> list SAST and IaC risks
-/security-engineer:run --scan --remote owner/repo       -> list risks for a remote repo
-/security-engineer:run --scan --remote all              -> list risks across all repos
+/security-engineer:script --scan                           -> list all risks, local repo
+/security-engineer:script --scan high                      -> list high+ risks only
+/security-engineer:script --scan sast,iac                  -> list SAST and IaC risks
+/security-engineer:script --scan --remote owner/repo       -> list risks for a remote repo
+/security-engineer:script --scan --remote all              -> list risks across all repos
 ```
 
 ## Flag Compatibility
@@ -203,7 +203,7 @@ Three independent enforcement layers:
 2. **Orchestrator gate** — returns immediately after fix plan; validation, commit, and PR steps are never reached
 3. **Commit guard** — `_commit_and_pr()` also checks dry_run as defense in depth
 
-The unit suite at `skills/security-engineer/tests/test_orchestrator.py` (inside the
+The unit suite at `skills/run/tests/test_orchestrator.py` (inside the
 plugin directory) verifies all three layers.
 
 ## Pipeline (Live Mode)
@@ -337,7 +337,7 @@ manifest entry the alert's prose names, cross-checked against the manifest, whic
 is the authority. Per-ecosystem agent instructions live in `fix-agents/cve/`.
 
 **Inspect a decision by hand** — no Orca token or alert needed. `run_agent.py`
-sits beside `orchestrator.py` in the plugin's `skills/security-engineer/`:
+sits beside `orchestrator.py` in the plugin's `skills/run/`:
 
 ```bash
 python3 run_agent.py resolve-version pypi pillow 8.3.1

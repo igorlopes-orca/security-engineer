@@ -20,7 +20,7 @@ SANDBOX_REPO="${SANDBOX_REPO:-igorlopes-orca/vulnerable-apps}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-fix/orca-}"
 
 RUNS_DIR="$REPO_ROOT/devloop/runs"
-ORCHESTRATOR="$REPO_ROOT/skills/security-engineer/orchestrator.py"
+ORCHESTRATOR="$REPO_ROOT/skills/run/orchestrator.py"
 DEVLOOP_CONFIG_YAML="$DEVLOOP_DIR/orca-check.yaml"
 
 # Secrets live in a gitignored .env, never in this file.

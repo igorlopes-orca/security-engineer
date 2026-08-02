@@ -20,9 +20,9 @@ claude plugin install security-engineer@orca-security
 
 echo ""
 echo "Done! Restart Claude Code or run /reload-plugins, then use:"
-echo "  /security-engineer:run                — fix all alerts"
-echo "  /security-engineer:run --dry-run      — plan only"
-echo "  /security-engineer:run --scan         — list risks"
+echo "  /security-engineer:script                — fix all alerts"
+echo "  /security-engineer:script --dry-run      — plan only"
+echo "  /security-engineer:script --scan         — list risks"
 echo ""
 echo "The same flags work in a shell as 'security-engineer ...', or just ask:"
 echo "  \"remediate all high vulnerabilities, max of 3\""

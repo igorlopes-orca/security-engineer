@@ -10,7 +10,7 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-orchestrator="$here/../skills/security-engineer/orchestrator.py"
+orchestrator="$here/../skills/run/orchestrator.py"
 
 if [[ ! -f "$orchestrator" ]]; then
   echo "security-engineer: orchestrator not found at $orchestrator" >&2

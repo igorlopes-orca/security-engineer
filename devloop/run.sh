@@ -21,6 +21,14 @@ devloop::require_token
 devloop::require_gh
 devloop::guard_sandbox
 
+# This run exercises the working tree. /security-engineer:run exercises the
+# installed copy, which nothing refreshes on its own — so say when the two have
+# diverged. A warning, not a failure: testing the working tree is exactly what
+# the dev loop is for, and a stale install does not make this run less valid.
+# `make loop` runs `make install` first, so it never trips.
+python3 "$DEVLOOP_DIR/plugin_sync.py" check --quiet || \
+  echo "         (this run still tests the working tree — only the skill is stale)" >&2
+
 for arg in "$@"; do
   [[ "$arg" == "--remote" || "$arg" == --remote=* ]] && \
     devloop::die "--remote is injected by run.sh — drop it from your arguments."

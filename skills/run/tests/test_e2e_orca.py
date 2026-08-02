@@ -7,7 +7,7 @@ produce the expected shapes from real data.
 
 Requires: ORCA_API_TOKEN env var.
 Run with:  make e2e
-           python3 .claude/skills/security-engineer/tests/test_e2e_orca.py
+           python3 .claude/skills/run/tests/test_e2e_orca.py
 """
 import os
 import sys

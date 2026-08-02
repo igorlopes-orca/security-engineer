@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for package identification (skills/security-engineer/package_identity.py).
+Tests for package identification (skills/run/package_identity.py).
 
 Hermetic: no network, no claude subprocess. Manifests are written to temp
 directories rather than mocked, because the bugs worth catching here are in the

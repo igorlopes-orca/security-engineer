@@ -3,7 +3,7 @@
 # warns and falls back to defaults (run.sh checks and tells you).
 #
 # This file exists so the loop exercises the real Phase 4 path quickly. It does
-# NOT change what ships — the defaults in skills/security-engineer/config.py
+# NOT change what ships — the defaults in skills/run/config.py
 # are untouched.
 
 orca_check:
