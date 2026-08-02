@@ -29,10 +29,23 @@ sys.path.insert(0, str(_DIR.parent))                 # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import orchestrator
-import pipelines.base
-from orchestrator import AlertTask, FixAgentResult, TIMEOUTS
+from orchestrator import TIMEOUTS, AlertTask, FixAgentResult
 from pipelines import CvePipeline, FixPipeline, FixPlan, get_pipeline
 from validator import _DIFF_LIMITS, ValidationResult
+
+# config.load_config() reads its YAML through PyYAML, and without it the loader
+# warns and hands back defaults instead of raising. Tests that assert on parsed
+# values therefore describe behaviour that only exists where PyYAML is
+# installed; skipped rather than left to fail with a defaults-vs-file mismatch
+# that says nothing about the missing package. CI installs it so these run for
+# real — see .github/workflows/ci.yml.
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None
+
+requires_yaml = unittest.skipIf(
+    _yaml is None, "config parsing needs PyYAML (pip install pyyaml)")
 
 _REQUIREMENTS = ("numpy==1.21.0\n"
                  "pillow==8.3.1\n"
@@ -969,6 +982,7 @@ class TestSummaryVersionMismatch(unittest.TestCase):
 
     def test_wired_into_sanity_check(self):
         import inspect
+
         from validator import sanity_check
         self.assertIn("diff_summary", inspect.signature(sanity_check).parameters)
         src = inspect.getsource(sanity_check)
@@ -1015,6 +1029,7 @@ class TestVersionDataConfig(unittest.TestCase):
         self.assertEqual(vd.cache_ttl_sec, 6 * 3600)
         self.assertFalse(vd.offline)
 
+    @requires_yaml
     def test_section_parses(self):
         cfg = self._load("version_data:\n"
                          "  cache_ttl_sec: 60\n"
@@ -1022,6 +1037,7 @@ class TestVersionDataConfig(unittest.TestCase):
         self.assertEqual(cfg.version_data.cache_ttl_sec, 60)
         self.assertTrue(cfg.version_data.offline)
 
+    @requires_yaml
     def test_both_sections_parse_together(self):
         """The old top-level filter hardcoded != "orca_check"; a second section
         would have leaked into the Config constructor."""
@@ -1034,6 +1050,7 @@ class TestVersionDataConfig(unittest.TestCase):
         self.assertTrue(cfg.version_data.offline)
         self.assertEqual(cfg.max_parallel_fixes, 2)
 
+    @requires_yaml
     def test_unknown_keys_are_dropped(self):
         cfg = self._load("version_data:\n  nonsense: 1\n  offline: true\n")
         self.assertTrue(cfg.version_data.offline)

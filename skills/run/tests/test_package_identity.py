@@ -20,10 +20,24 @@ sys.path.insert(0, str(_DIR.parent))                 # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import package_identity
-from package_identity import (cve_ids_from_alert, find_dependency,
-                              identify_package, normalize_name, parse_spec,
-                              read_manifest)
+from package_identity import (
+    cve_ids_from_alert,
+    find_dependency,
+    identify_package,
+    normalize_name,
+    parse_spec,
+    read_manifest,
+)
 from version_data import ECOSYSTEMS
+
+# tomllib is stdlib only from 3.11, and package_identity degrades to "no
+# dependencies found" without it rather than refusing to import. On the 3.10
+# floor these manifests genuinely parse to nothing, so the assertions below
+# describe 3.11+ behaviour and are skipped rather than made to lie.
+requires_tomllib = unittest.skipIf(
+    package_identity.tomllib is None,
+    "TOML manifests are only parsed where tomllib exists (Python 3.11+)",
+)
 
 _PYPI = ECOSYSTEMS["pypi"]
 _NPM = ECOSYSTEMS["npm"]
@@ -227,6 +241,7 @@ class TestReadGoMod(_TreeCase):
 class TestReadOtherManifests(_TreeCase):
     """Cargo, pyproject, pom and the Ruby pair."""
 
+    @requires_tomllib
     def test_cargo_toml_string_and_table_forms(self):
         text = ('[dependencies]\n'
                 'serde = "1.0.100"\n'
@@ -238,6 +253,7 @@ class TestReadOtherManifests(_TreeCase):
         self.assertEqual(deps["tokio"].version, "1.20.0")
         self.assertEqual(deps["criterion"].version, "0.4.0")
 
+    @requires_tomllib
     def test_pyproject_pep621_list(self):
         text = ('[project]\n'
                 'name = "x"\n'
@@ -246,6 +262,7 @@ class TestReadOtherManifests(_TreeCase):
         self.assertEqual(deps["pillow"].version, "8.3.1")
         self.assertFalse(deps["requests"].exact)
 
+    @requires_tomllib
     def test_pyproject_poetry_table(self):
         text = ('[tool.poetry.dependencies]\n'
                 'python = "^3.10"\n'
