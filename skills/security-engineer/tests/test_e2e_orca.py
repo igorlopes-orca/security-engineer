@@ -72,6 +72,11 @@ REQUIRED_FIELDS = {
     "verification":   str,
     "first_commit":   dict,
     "is_test_file":   bool,
+    # Passthrough for the two rich payloads. Present so a live run reveals
+    # whether Orca already supplies structured package/version data for a
+    # package CVE — see _normalize_alert.
+    "asset_data":     dict,
+    "extra_findings": dict,
 }
 
 POSITION_FIELDS = {"start_line", "end_line"}

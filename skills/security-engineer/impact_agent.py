@@ -31,7 +31,7 @@ You are assessing the production risk of a security fix before it is deployed.
 
 ## Alert Details
 {alert_json}
-
+{fix_context}
 ## Git Diff
 ```diff
 {diff_text}
@@ -61,15 +61,75 @@ Guidelines:
 """
 
 
+def _render_fix_context(fix_context: dict | None) -> str:
+    """Ground-truth facts about the fix, for the prompt.
+
+    Without this the assessment is inferred from the diff plus the fix agent's
+    own prose, and the prose can be wrong: one sandbox PR bumped pillow to
+    12.3.0 while its summary said 11.3.0, and the same diff scored medium once
+    and high twice across three runs. A resolved bump distance is a fact, so
+    stating it removes the guesswork rather than adding to it.
+    """
+    if not fix_context:
+        return ""
+    decision = fix_context.get("version_decision") or {}
+    ref = fix_context.get("package_ref") or {}
+    if not decision.get("target_version"):
+        return ""
+
+    lines = ["", "## Fix Context (resolved from advisory data, not inferred)", ""]
+    lines.append(f"- Package: {ref.get('package')} ({ref.get('ecosystem')})")
+    lines.append(f"- Version: {decision.get('current_version')} → "
+                 f"{decision.get('target_version')}")
+    span = decision.get("bump_class", "unknown")
+    majors = decision.get("majors_crossed") or 0
+    if majors > 1:
+        span += f", crossing {majors} major versions"
+    lines.append(f"- Bump: {span}")
+    if not ref.get("exact_pin", True):
+        lines.append("- The previous pin was a version range, so the installed "
+                     "version was inferred rather than read exactly")
+
+    cleared = decision.get("advisories_cleared") or []
+    if cleared:
+        shown = ", ".join(cleared[:8])
+        more = f" (+{len(cleared) - 8} more)" if len(cleared) > 8 else ""
+        lines.append(f"- Advisories cleared: {shown}{more}")
+    remaining = decision.get("advisories_remaining") or []
+    if remaining:
+        lines.append(f"- Still affected after this bump: {', '.join(remaining)}")
+    unknown = decision.get("advisories_unknown_scope") or []
+    if unknown:
+        lines.append(f"- Could not be assessed (no version range in the "
+                     f"advisory): {', '.join(unknown)}")
+    others = [c.get("version") for c in (decision.get("candidates") or [])
+              if c.get("version") != decision.get("target_version")]
+    lines.append(f"- Other safe versions available: "
+                 f"{', '.join(others) if others else 'none — this is the only '
+                                                     'published version that clears them'}")
+    lines.append("")
+    lines.append("Weigh the bump distance when judging risk: a major-version jump "
+                 "can remove public APIs and raise language or runtime floors, "
+                 "even though the diff itself is one line.")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def analyze_impact(
     alert_json: dict,
     diff_text: str,
     timeout_sec: int = 90,
+    fix_context: dict | None = None,
 ) -> ImpactResult:
-    """Invoke claude subprocess to assess production impact. Returns ImpactResult."""
+    """Invoke claude subprocess to assess production impact. Returns ImpactResult.
+
+    fix_context: a specialist's FixPlan.metadata, when the type produced one.
+                 Facts the model would otherwise have to infer from the diff.
+    """
     prompt = _PROMPT.format(
         alert_json=json.dumps(alert_json, indent=2),
         diff_text=diff_text[:6000],
+        fix_context=_render_fix_context(fix_context),
     )
     # No tools at all — see _SINGLE_SHOT_TOOL_FLAGS for why denying them was
     # not the same thing, and cost 6x more.

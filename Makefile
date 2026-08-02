@@ -8,6 +8,7 @@ test:
 	python3 skills/security-engineer/tests/test_orchestrator.py
 	python3 skills/security-engineer/tests/test_version_data.py
 	python3 skills/security-engineer/tests/test_package_identity.py
+	python3 skills/security-engineer/tests/test_pipelines.py
 	python3 devloop/tests/test_observe.py
 
 # Integration tests — requires ORCA_API_TOKEN

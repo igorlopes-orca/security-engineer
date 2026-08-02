@@ -26,21 +26,42 @@ class OrcaCheckConfig:
 
 
 @dataclass
+class VersionDataConfig:
+    """Controls the OSV/deps.dev lookup behind CVE version decisions.
+
+    cache_dir empty means the module default (~/.cache/security-engineer). The
+    cache is what keeps a 12-way concurrent run from hammering two public APIs.
+    """
+    enabled: bool = True
+    cache_dir: str = ""
+    cache_ttl_sec: int = 6 * 3600
+    timeout_sec: int = 20
+    offline: bool = False           # serve from cache only, never call out
+    osv_url: str = ""               # empty means the module default
+    deps_dev_url: str = ""
+
+
+@dataclass
 class Config:
     orca_check: OrcaCheckConfig = field(default_factory=OrcaCheckConfig)
+    version_data: VersionDataConfig = field(default_factory=VersionDataConfig)
     max_parallel_fixes: int = 4
     max_parallel_repos: int = 3
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Merge override into base, recursing into nested dicts."""
-    merged = dict(base)
-    for k, v in override.items():
-        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
-            merged[k] = _deep_merge(merged[k], v)
-        else:
-            merged[k] = v
-    return merged
+# Nested sections, mapped to the dataclass that parses each. Adding a section
+# means adding one entry here — the previous shape hardcoded `!= "orca_check"` in
+# the top-level filter, so a second section silently landed in the wrong place.
+_SECTIONS = {
+    "orca_check": OrcaCheckConfig,
+    "version_data": VersionDataConfig,
+}
+
+
+def _parse_section(raw: dict, cls):
+    """Build a section dataclass, dropping keys it does not declare."""
+    return cls(**{k: v for k, v in (raw or {}).items()
+                  if k in cls.__dataclass_fields__})
 
 
 def load_config() -> Config:
@@ -62,14 +83,10 @@ def load_config() -> Config:
         print(f"[WARN] failed to read config {config_path}: {e}", flush=True)
         return Config()
 
-    orca_raw = raw.get("orca_check", {})
-    orca = OrcaCheckConfig(**{
-        k: v for k, v in orca_raw.items()
-        if k in OrcaCheckConfig.__dataclass_fields__
-    })
-
+    sections = {name: _parse_section(raw.get(name, {}), cls)
+                for name, cls in _SECTIONS.items()}
     top = {
         k: v for k, v in raw.items()
-        if k in Config.__dataclass_fields__ and k != "orca_check"
+        if k in Config.__dataclass_fields__ and k not in _SECTIONS
     }
-    return Config(orca_check=orca, **top)
+    return Config(**sections, **top)

@@ -71,9 +71,40 @@ After installing, the skill is namespaced under `security-engineer:`:
 /security-engineer:run --scan --remote all          → list risks across all repos
 ```
 
+## CVE version decisions
+
+For a package CVE the target version is resolved before the fix agent runs, from
+[OSV.dev](https://osv.dev) advisory ranges plus the published version list from
+[deps.dev](https://deps.dev) — both free, unauthenticated, and cached on disk. The
+agent is told which version to apply rather than asked to find it.
+
+Policy is **minimum safe at any distance**: the lowest published release that
+clears every advisory affecting the installed version, queried package-wide so a
+bump cannot land on a different known CVE. A major-version jump is not refused —
+some packages have no safe release inside the current major — but the distance is
+measured and passed to the production-impact assessment.
+
+Inspect any decision without a token, an alert, or a pipeline run:
+
+```bash
+python3 skills/security-engineer/run_agent.py resolve-version pypi pillow 8.3.1
+```
+
+Ecosystems: PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet. See
+`skills/security-engineer/SKILL.md` for the `version_data:` config keys.
+
 ## Language coverage
 
-Phase 3 of the validation pipeline runs a local build check. Build root detection uses the alert's source file path (from Orca), so subdirectory apps and monorepos are handled correctly.
+Each finding type runs through a pipeline (`skills/security-engineer/pipelines/`)
+that owns its own post-fix check.
+
+**CVE:** the manifest must pin the resolved version, a lockfile beside it must
+agree, and the applied version must carry no known advisory. Plus `go build ./...`
+(Go) or `cargo metadata --locked` (Cargo) where the toolchain is present.
+
+**sast / iac / secret:** a local build check, with the build root detected from the
+alert's source file path (from Orca), so subdirectory apps and monorepos are
+handled correctly.
 
 | Language | Build check | Root detection |
 |---|---|---|
@@ -83,7 +114,8 @@ Phase 3 of the validation pipeline runs a local build check. Build root detectio
 | Terraform | `terraform validate` | directory of the changed `.tf` file |
 | Other (YAML, Dockerfile, …) | skipped | — |
 
-If the build tool isn't installed the check is skipped (not failed) — CI in Phase 4 catches regressions.
+If the build tool isn't installed the check is skipped (not failed) — the Orca
+check and CI gates catch regressions.
 
 ## Plugin layout
 

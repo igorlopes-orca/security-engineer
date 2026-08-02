@@ -137,8 +137,58 @@ _SECRET_PATTERNS = [
 ]
 
 
+_VERSION_TOKEN = re.compile(r"\bv?\d+\.\d+(?:\.\d+)*(?:[-+.][0-9A-Za-z.-]+)?\b")
+
+
+def summary_version_mismatch(diff_summary: str, diff_text: str) -> str:
+    """Does the fix agent's summary name a version its own diff never contains?
+
+    A sandbox PR shipped the body "Bumped pillow from 8.3.1 to 11.3.0" over a
+    diff that read `+pillow==12.3.0`. That summary is what the PR body and the
+    impact prompt are built from, so a wrong one misleads both a reviewer and the
+    risk assessment. The check is deliberately narrow: only versions the summary
+    presents as *new* are required to appear among the diff's added lines, so
+    naming the old version, an unrelated release, or a CVE year stays fine.
+
+    Returns a failure message, or "" when consistent.
+    """
+    if not diff_summary or not diff_text:
+        return ""
+
+    added = "\n".join(l for l in diff_text.splitlines()
+                      if l.startswith("+") and not l.startswith("+++"))
+    if not added:
+        return ""
+    present = set(_VERSION_TOKEN.findall(added))
+    # Compare without a leading v so "v0.17.0" in a summary matches "0.17.0" in
+    # the diff and vice versa.
+    present_bare = {v.lstrip("vV") for v in present}
+
+    claimed = _claimed_new_versions(diff_summary)
+    missing = [v for v in claimed if v.lstrip("vV") not in present_bare]
+    if not missing:
+        return ""
+    return (f"fix summary claims version {', '.join(missing)} but the diff adds "
+            f"{', '.join(sorted(present)) or 'no version'} — the summary does not "
+            "describe the change")
+
+
+# "to 1.2.3", "-> 1.2.3", "to version 1.2.3". Only the destination is checked;
+# the source version legitimately does not appear among added lines.
+_CLAIMED_NEW = re.compile(
+    r"(?:\bto\b\s+(?:version\s+)?|->\s*|→\s*)(v?\d+\.\d+(?:\.\d+)*(?:[-+.][0-9A-Za-z.-]+)?)",
+    re.IGNORECASE)
+
+
+def _claimed_new_versions(summary: str) -> list:
+    """Versions the summary presents as the new one."""
+    return list(dict.fromkeys(_CLAIMED_NEW.findall(summary or "")))
+
+
 def sanity_check(alert: dict, worktree_path: Path,
-                 feature_type: str | None = None) -> ValidationResult:
+                 feature_type: str | None = None,
+                 diff_limit: int | None = None,
+                 diff_summary: str | None = None) -> ValidationResult:
     """Phase 1 gate: the diff is non-empty, within size limits, and adds no secrets.
 
     feature_type: the *resolved* type ("cve"/"sast"/"iac"/"secret"), which selects
@@ -146,6 +196,11 @@ def sanity_check(alert: dict, worktree_path: Path,
                   and that is empty for package CVEs — they are identified by
                   category instead — so relying on it silently applied the 50-line
                   sast limit to lockfile bumps that legitimately need 200.
+    diff_limit:   explicit override, supplied by the type's FixPipeline so the
+                  budget lives next to the rest of that type's behaviour. Falls
+                  back to the _DIFF_LIMITS table when absent.
+    diff_summary: the fix agent's own account of what it did. When given, it is
+                  checked against the diff — see summary_version_mismatch.
     """
     failures = []
     ft = (feature_type or _resolve_feature_type(alert) or "sast").lower()
@@ -156,9 +211,14 @@ def sanity_check(alert: dict, worktree_path: Path,
                                 failures=["git diff is empty — no changes were made"])
 
     total = diff_line_count(diff_text)
-    limit = _DIFF_LIMITS.get(ft, 50)
+    limit = diff_limit if diff_limit is not None else _DIFF_LIMITS.get(ft, 50)
     if total > limit:
         failures.append(f"diff too large: {total} lines changed (limit {limit} for {ft})")
+
+    if diff_summary:
+        mismatch = summary_version_mismatch(diff_summary, diff_text)
+        if mismatch:
+            failures.append(mismatch)
 
     if ft == "secret":
         added = [l for l in diff_text.splitlines()

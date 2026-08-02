@@ -170,7 +170,54 @@ def _normalize_alert(item):
         "verification":   findings.get("active_verification_status", ""),
         "first_commit":   findings.get("first_commit", {}),
         "is_test_file":   findings.get("is_test_file", False),
+        # Whatever else the two rich payloads carried. fetch_alert_by_id has
+        # always requested AssetData and this function has always dropped it, so
+        # nobody knows whether Orca already supplies a structured package name,
+        # installed version or fixed version for a package CVE — which is exactly
+        # what the CVE pipeline has to recover from the repository instead.
+        # Preserved rather than parsed: guessing at key names we have never seen
+        # would be speculative, and keeping them makes it a `get-alert` away.
+        "asset_data":     _bounded(val(item, "AssetData", {})),
+        "extra_findings": _bounded(_unknown_finding_keys(findings)),
     }
+
+
+# Everything _normalize_alert already promotes to a top-level key. Anything else
+# in RiskFindings is passed through under "extra_findings".
+_KNOWN_FINDING_KEYS = {
+    "position", "ai_triage", "code_snippet", "feature_type", "origin_url",
+    "active_verification_status", "first_commit", "is_test_file",
+}
+
+# The normalized alert is pretty-printed into the fix agent's prompt, so an
+# unbounded passthrough would push the actual instructions out of the way.
+_PASSTHROUGH_LIMIT = 4000
+
+
+def _unknown_finding_keys(findings):
+    """RiskFindings entries that do not already have a home."""
+    if not isinstance(findings, dict):
+        return {}
+    return {k: v for k, v in findings.items() if k not in _KNOWN_FINDING_KEYS}
+
+
+def _bounded(value, limit=_PASSTHROUGH_LIMIT):
+    """Drop a passthrough payload that cannot safely go into a prompt.
+
+    Serialized strictly, with no `default=` fallback, because the caller that
+    ultimately renders this dict — `_invoke_fix_agent` building the fix prompt —
+    calls json.dumps without one. Anything that would raise there has to be
+    dropped here instead, or an unexpected payload takes the whole fix down.
+    """
+    if not value:
+        return {} if isinstance(value, dict) else value
+    try:
+        size = len(json.dumps(value))
+    except (TypeError, ValueError):
+        return {"_dropped": "not JSON-serializable"}
+    if size > limit:
+        return {"_dropped": f"{size} bytes exceeds the {limit}-byte prompt budget"}
+    return value
 
 
 def fetch_alert_by_id(alert_id, token):
