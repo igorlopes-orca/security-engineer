@@ -103,3 +103,21 @@ examples/                    → usage examples
 |---|---|---|
 | `ORCA_API_TOKEN` | Yes | Orca API token (base64 string from Orca config) |
 | `NOTIFY_WEBHOOK_URL` | No | Webhook URL for Slack/Teams notifications |
+
+## Developing
+
+Unit tests cover argument parsing and mocked branches; the pipeline that matters
+— worktree lifecycle, what the validation gates actually see, whether the Orca
+check gate fires — only exists in a live run. `devloop/` makes that one command:
+
+```bash
+cp devloop/.env.example devloop/.env   # fill in ORCA_API_TOKEN
+make test                               # unit tests, no token or network
+make fast                               # test → reset sandbox → fix one alert → report
+make loop ARGS="--dry-run cve"          # plan only, no writes
+```
+
+`make fast` runs the orchestrator against a disposable sandbox repo and prints
+per-alert state, PR URLs, Orca check conclusions, and the annotations behind any
+failure. See [`devloop/README.md`](devloop/README.md). Nothing in `devloop/` ships
+with the plugin.

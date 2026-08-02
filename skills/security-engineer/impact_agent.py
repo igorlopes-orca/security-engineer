@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
+from validator import (_subprocess_error_detail, _SINGLE_SHOT_MAX_TURNS,
+                       _SINGLE_SHOT_TOOL_FLAGS)
 
 
 @dataclass
@@ -69,10 +71,13 @@ def analyze_impact(
         alert_json=json.dumps(alert_json, indent=2),
         diff_text=diff_text[:6000],
     )
+    # No tools at all — see _SINGLE_SHOT_TOOL_FLAGS for why denying them was
+    # not the same thing, and cost 6x more.
     cmd = [
         "claude", "-p", prompt,
+        *_SINGLE_SHOT_TOOL_FLAGS,
         "--output-format", "json",
-        "--max-turns", "1",
+        "--max-turns", str(_SINGLE_SHOT_MAX_TURNS),
     ]
     try:
         result = subprocess.run(
@@ -88,13 +93,15 @@ def analyze_impact(
         )
 
     if result.returncode != 0:
-        stderr = result.stderr[:500]
-        print(f"[WARN] impact analysis failed (exit={result.returncode}): {stderr}")
+        # claude reports its own failures on stdout, not stderr — see
+        # _subprocess_error_detail. Logging stderr alone printed an empty string.
+        detail = _subprocess_error_detail(result)
+        print(f"[WARN] impact analysis failed (exit={result.returncode}): {detail}")
         return ImpactResult(
             level="medium",
             description="Impact analysis failed — treating as medium risk",
             downtime_risk=False, requires_deploy=True,
-            error=f"exit_code={result.returncode}: {stderr}",
+            error=f"exit_code={result.returncode}: {detail}",
         )
 
     return _parse(result.stdout)

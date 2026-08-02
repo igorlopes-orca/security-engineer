@@ -147,7 +147,7 @@ For each alert (up to 4 in parallel, isolated git worktree per alert):
   8. open-pr                -> run_agent.py open-pr (includes impact in PR body)
   9. validate (Phase 4)     -> Orca check gate (see Orca Check Gate below)
  10. validate (Phase 5)     -> CI gate: gh pr checks --watch (timeout: 10min)
- 11. notify                 -> console + log file + GitHub PR comment
+ 11. notify                 -> console + log file (+ webhook if configured)
  12. remove_worktree        -> cleanup worktree + local branch (runs in a finally,
                               so it happens on every exit path incl. exceptions)
 ```
@@ -229,7 +229,9 @@ Always active:
 
 Opt-in:
 - `NOTIFY_WEBHOOK_URL=https://...` -> HTTP POST on every event (Slack, Teams, etc.)
-- GitHub PR comment with impact assessment (posted automatically after PR is opened)
+The impact assessment goes into the **PR body** at creation time (step 8), not a
+separate comment — impact is computed before the PR is opened, so a comment could
+only repeat it.
 
 ## Environment Variables
 
