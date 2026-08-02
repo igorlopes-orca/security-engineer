@@ -15,6 +15,7 @@ Hermetic: no network, no claude subprocess.
 Run with: python3 tests/test_pipelines.py
 """
 import copy
+import inspect
 import json
 import os
 import sys
@@ -784,6 +785,67 @@ class TestImpactFixContext(unittest.TestCase):
         self.assertIn("fix_context=plan.metadata", src)
 
 
+class TestSingleShotContract(unittest.TestCase):
+    """Every no-tools prompt must say so, or it spends its turn asking to look.
+
+    Live run 20260802T030948Z: 2 of 3 alerts lost their impact assessment once
+    the prompt grew a Fix Context section — one replied "I'll ground this in the
+    actual repo contents before judging" and produced no JSON, the other ran past
+    its timeout. Removing the tools is not enough; the model has to be told.
+    """
+
+    def _prompts(self):
+        import impact_agent
+        import validator
+        return {"impact": impact_agent._PROMPT, "llm_validate": validator._LLM_PROMPT}
+
+    def test_both_prompts_take_the_contract(self):
+        for name, template in self._prompts().items():
+            with self.subTest(name):
+                self.assertIn("{contract}", template,
+                              f"{name} prompt does not include the contract")
+
+    def test_contract_states_the_key_constraints(self):
+        from validator import _SINGLE_SHOT_CONTRACT
+        lowered = _SINGLE_SHOT_CONTRACT.lower()
+        for phrase in ("no tools", "cannot read", "do not narrate",
+                       "answer directly"):
+            with self.subTest(phrase):
+                self.assertIn(phrase, lowered)
+
+    def test_contract_is_last_before_the_json_block(self):
+        """It has to be the final instruction, not buried mid-prompt."""
+        for name, template in self._prompts().items():
+            with self.subTest(name):
+                after = template.split("{contract}", 1)[1]
+                self.assertIn("Return ONLY this JSON", after)
+                self.assertNotIn("##", after,
+                                 f"{name}: content follows the contract")
+
+    def test_json_block_forbids_a_preamble(self):
+        """"nothing after" allowed the prose-then-nothing failure."""
+        for name, template in self._prompts().items():
+            with self.subTest(name):
+                self.assertIn("nothing before or after", template)
+
+    def test_rendered_impact_prompt_ends_with_the_json_shape(self):
+        import impact_agent
+        from validator import _SINGLE_SHOT_CONTRACT
+        rendered = impact_agent._PROMPT.format(
+            alert_json="{}", diff_text="d",
+            fix_context=impact_agent._render_fix_context(_DECISION),
+            contract=_SINGLE_SHOT_CONTRACT)
+        self.assertIn("no tools", rendered.lower())
+        self.assertLess(rendered.index("no tools"), rendered.index('"level"'))
+
+    def test_impact_timeout_has_headroom_for_the_richer_prompt(self):
+        """90s was the budget before Fix Context existed; one alert overran it."""
+        import impact_agent
+        default = inspect.signature(
+            impact_agent.analyze_impact).parameters["timeout_sec"].default
+        self.assertGreaterEqual(default, 120)
+
+
 class TestWhatChangedSection(unittest.TestCase):
     """The PR body should describe the decision, not the agent's account of it."""
 
@@ -1080,6 +1142,7 @@ if __name__ == "__main__":
         TestNextCandidateHint,
         TestEcosystemFragments,
         TestImpactFixContext,
+        TestSingleShotContract,
         TestWhatChangedSection,
         TestSummaryVersionMismatch,
         TestVersionDataConfig,

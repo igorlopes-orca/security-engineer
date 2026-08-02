@@ -8,6 +8,7 @@ Verifies that argument parsing, filter logic, and flag enforcement
 Run with: python3 tests/test_orchestrator.py
 No API token or network access required — all tests are pure Python.
 """
+import inspect
 import shutil
 import subprocess
 import sys
@@ -1129,12 +1130,16 @@ class TestBuildPromptContext(unittest.TestCase):
 class TestImpactAnalysisErrors(unittest.TestCase):
     """Verify that analyze_impact() captures and surfaces error details."""
 
+    # Derived from the function's own default so raising the budget does not
+    # break the test that only cares that a timeout is surfaced at all.
+    _TIMEOUT = inspect.signature(analyze_impact).parameters["timeout_sec"].default
+
     CASES = [
         (
             "timeout returns error field",
-            subprocess.TimeoutExpired(cmd=["claude"], timeout=90),
+            subprocess.TimeoutExpired(cmd=["claude"], timeout=_TIMEOUT),
             None,  # no CompletedProcess
-            "timeout after 90s",
+            f"timeout after {_TIMEOUT}s",
         ),
         (
             "non-zero exit stores stderr",

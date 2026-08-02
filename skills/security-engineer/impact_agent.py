@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from validator import (_subprocess_error_detail, _SINGLE_SHOT_MAX_TURNS,
-                       _SINGLE_SHOT_TOOL_FLAGS)
+from validator import (_subprocess_error_detail, _SINGLE_SHOT_CONTRACT,
+                       _SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS)
 
 
 @dataclass
@@ -44,7 +44,13 @@ Analyze the diff in the context of the vulnerability and answer:
 4. What manual steps must an operator take before or after deploying?
 5. Are there concerns a code reviewer should know?
 
-Return ONLY this JSON as your final output (nothing after this block):
+Guidelines:
+- "low"   → code logic change only, no infra impact, no redeploy needed
+- "medium" → rebuild/redeploy required, dep version bump, possible brief disruption
+- "high"  → secret rotation required, env var must be set before deploy, significant breaking risk
+
+{contract}
+Return ONLY this JSON, with nothing before or after it:
 {{
   "level": "low|medium|high",
   "description": "<one sentence: what is the production risk>",
@@ -53,11 +59,6 @@ Return ONLY this JSON as your final output (nothing after this block):
   "manual_steps": ["step 1", "step 2"],
   "concerns": ["optional reviewer concern"]
 }}
-
-Guidelines:
-- "low"   → code logic change only, no infra impact, no redeploy needed
-- "medium" → rebuild/redeploy required, dep version bump, possible brief disruption
-- "high"  → secret rotation required, env var must be set before deploy, significant breaking risk
 """
 
 
@@ -118,7 +119,7 @@ def _render_fix_context(fix_context: dict | None) -> str:
 def analyze_impact(
     alert_json: dict,
     diff_text: str,
-    timeout_sec: int = 90,
+    timeout_sec: int = 120,
     fix_context: dict | None = None,
 ) -> ImpactResult:
     """Invoke claude subprocess to assess production impact. Returns ImpactResult.
@@ -130,6 +131,7 @@ def analyze_impact(
         alert_json=json.dumps(alert_json, indent=2),
         diff_text=diff_text[:6000],
         fix_context=_render_fix_context(fix_context),
+        contract=_SINGLE_SHOT_CONTRACT,
     )
     # No tools at all — see _SINGLE_SHOT_TOOL_FLAGS for why denying them was
     # not the same thing, and cost 6x more.

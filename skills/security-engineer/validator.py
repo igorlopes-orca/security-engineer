@@ -62,6 +62,19 @@ class OrcaCheckFinding:
 # enough — measured at exactly 1 turn across 5 trials. The turn cap was never
 # the real lever.
 _SINGLE_SHOT_TOOL_FLAGS = ["--tools", ""]
+
+# Removing the tools is necessary but not sufficient: the model does not know
+# they are gone, so on a prompt that invites investigation it can open with prose
+# like "I'll ground this in the actual repo contents before judging" and spend its
+# single turn saying so, leaving no JSON to parse. Observed on 2 of 3 alerts in a
+# live run once the impact prompt grew a Fix Context section. Every single-shot
+# prompt ends with this so the constraint is the last thing read.
+_SINGLE_SHOT_CONTRACT = """\
+You have no tools and cannot read the repository, run commands, or fetch \
+anything. The material above is everything available and it is sufficient — do \
+not ask for more, do not describe what you would check first, and do not narrate \
+your reasoning. Answer directly.
+"""
 _SINGLE_SHOT_MAX_TURNS = 1
 
 
@@ -247,7 +260,8 @@ You are reviewing a security fix diff. Does this fix correctly address the vulne
 {diff_text}
 ```
 
-Return ONLY this JSON as your final output (nothing after):
+{contract}
+Return ONLY this JSON, with nothing before or after it:
 {{
   "verdict": "pass|fail|uncertain",
   "reason": "<one sentence>",
@@ -266,6 +280,7 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
     prompt = _LLM_PROMPT.format(
         alert_json=json.dumps(alert, indent=2),
         diff_text=diff_text,
+        contract=_SINGLE_SHOT_CONTRACT,
     )
     cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
            "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
