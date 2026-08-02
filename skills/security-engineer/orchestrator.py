@@ -91,7 +91,12 @@ class AlertTask:
 def _run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None) -> tuple[str, str, int]:
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if check and r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"Command failed: {' '.join(str(c) for c in cmd)}")
+        # Fall back to stdout before giving up on a message. run_agent.py reports
+        # failures as JSON on stdout ({"error": "Alert … not found"}) and writes
+        # nothing to stderr, so a stderr-only check threw away the one useful
+        # line and raised a bare "Command failed: python3 …" instead.
+        detail = r.stderr.strip() or r.stdout.strip()
+        raise RuntimeError(detail or f"Command failed: {' '.join(str(c) for c in cmd)}")
     return r.stdout.strip(), r.stderr.strip(), r.returncode
 
 
@@ -689,6 +694,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
                 check_name=orca_cfg.check_name,
                 timeout_sec=orca_cfg.timeout_sec,
                 poll_interval=orca_cfg.poll_interval_sec,
+                on_not_found=orca_cfg.on_not_found,
             )
             if orca_val.passed:
                 if orca_val.needs_review:
@@ -1007,6 +1013,17 @@ def _print_plan(to_fix, skipped, scm_posture, unfixable, repo, dry_run):
             print(f"  {i}. {t.alert_id} — {t.title} ({t.risk_level}, {t.feature_type}) — {t.source}")
 
 
+def exit_code_for(tasks: list[AlertTask]) -> int:
+    """Process exit code for a set of finished alerts: 0 clean, 1 if any failed.
+
+    The run used to exit 0 even when the summary printed "Fix Failed (1)", so
+    any CI wrapper or `&&` chain read a broken run as green. CI_FAILED counts as
+    a failure too — the PR exists, but its checks are red, which is not success.
+    Skipped alerts are not failures; nothing was attempted.
+    """
+    return 1 if any(t.state in ("FAILED", "TIMED_OUT", "CI_FAILED") for t in tasks) else 0
+
+
 def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: list[dict],
                    repo: str, dry_run: bool):
     mode = "DRY-RUN" if dry_run else "Live"
@@ -1159,13 +1176,16 @@ def _get_repo_url(repo_name: str) -> str:
     return stdout.strip()
 
 
-def run_all_repos(args) -> None:
-    """Discover all repos with open Orca alerts and run the fix pipeline on each."""
+def run_all_repos(args) -> int:
+    """Discover all repos with open Orca alerts and run the fix pipeline on each.
+
+    Returns a process exit code: non-zero if any repo errored or any alert failed.
+    """
     token = get_token()
     repos = list_repositories(token)
     if not repos:
         print("No repositories with open alerts found in Orca.")
-        return
+        return 0
 
     mode = "DRY-RUN" if args.dry_run else "LIVE"
     print(f"\nFound {len(repos)} repositories with open alerts. Mode: {mode}")
@@ -1191,6 +1211,11 @@ def run_all_repos(args) -> None:
                 }
 
     _print_global_summary(all_results, dry_run=args.dry_run)
+
+    if any(d.get("error") for d in all_results.values()):
+        return 1
+    return max((exit_code_for(d.get("results", [])) for d in all_results.values()),
+               default=0)
 
 
 # ---------------------------------------------------------------------------
@@ -1231,7 +1256,7 @@ def main(argv=None):
         if args.dry_run:
             print("Mode: DRY-RUN — fix agents will read files and plan fixes, cannot edit.")
         if args.remote == "all":
-            run_all_repos(args)
+            return run_all_repos(args)
         elif "/" in args.remote:
             try:
                 url = _get_repo_url(args.remote)
@@ -1243,9 +1268,9 @@ def main(argv=None):
                 sys.exit(f"Pipeline failed: {data['error']}")
             _print_summary(data["results"], data["skipped"], data["scm_posture"],
                            args.remote, args.dry_run)
+            return exit_code_for(data["results"])
         else:
             sys.exit("Error: --remote requires 'all' or 'owner/repo'")
-        return
 
     # Local mode — repo always auto-detected from git remote origin
     repo = _detect_repo()
@@ -1266,7 +1291,7 @@ def main(argv=None):
             event="run_complete", alert_id="-", feature_type="-", risk_level="-",
             repo=repo.name, succeeded=0, failed=0, skipped=len(skipped),
         ))
-        return
+        return 0
 
     results: list[AlertTask] = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -1291,7 +1316,8 @@ def main(argv=None):
         event="run_complete", alert_id="-", feature_type="-", risk_level="-",
         repo=repo.name, succeeded=succeeded, failed=failed, skipped=len(skipped),
     ))
+    return exit_code_for(results)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

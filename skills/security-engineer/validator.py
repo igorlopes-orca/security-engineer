@@ -44,6 +44,53 @@ class OrcaCheckFinding:
 # Shared: the diff every gate is judged against
 # ---------------------------------------------------------------------------
 
+# Flags for the single-shot "read this text, return JSON" subprocesses (LLM
+# validation, impact analysis). Neither needs a tool: the alert and the diff are
+# already in the prompt.
+#
+# `--tools ""` is the load-bearing part. It removes the tool definitions from
+# the model's context entirely. `--allowedTools ""` looks equivalent but is not:
+# it only *denies* the calls, so the model still emits tool_use blocks, each one
+# is refused, and each refusal costs a turn. Measured over 5 trials that cost
+# exactly 3 turns every time and 6.2x the money ($0.114 vs $0.018 per call),
+# with a tail that ran to 7 turns — which is what kept blowing past --max-turns
+# and exiting subtype=error_max_turns with an empty stderr. Both callers then
+# took their silent error path: validation passed everything with needs_review,
+# and every PR was labelled impact:medium regardless of the change.
+#
+# With no tools available there is nothing to attempt, so one turn is provably
+# enough — measured at exactly 1 turn across 5 trials. The turn cap was never
+# the real lever.
+_SINGLE_SHOT_TOOL_FLAGS = ["--tools", ""]
+_SINGLE_SHOT_MAX_TURNS = 1
+
+
+def _subprocess_error_detail(result, limit: int = 500) -> str:
+    """Best available explanation for a failed subprocess.
+
+    `claude -p --output-format json` reports its own failures in a JSON envelope
+    on *stdout* and leaves stderr empty, so a stderr-only message printed
+    "(no stderr)" and threw away the actual cause. Prefer stderr when there is
+    one, fall back to stdout, and surface the envelope's subtype when present
+    because that is the field that names the failure (e.g. error_max_turns).
+    """
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    if stderr:
+        return stderr[:limit]
+    if not stdout:
+        return "(no output)"
+    try:
+        envelope = json.loads(stdout)
+    except json.JSONDecodeError:
+        return stdout[:limit]
+    if isinstance(envelope, dict):
+        subtype = envelope.get("subtype") or envelope.get("error")
+        if subtype:
+            return f"{subtype}: {json.dumps(envelope)[:limit]}"
+    return stdout[:limit]
+
+
 def worktree_diff(worktree_path: Path) -> str:
     """Return the diff of everything a subsequent `git add -A` would commit.
 
@@ -74,7 +121,14 @@ def diff_line_count(diff_text: str) -> int:
 # Phase 1: Sanity checks (Python, always)
 # ---------------------------------------------------------------------------
 
-_DIFF_LIMITS = {"sast": 50, "iac": 50, "secret": 50, "cve": 200}
+# Per-type ceilings on how much a fix may change before it needs human eyes.
+#
+# sast is 100 rather than 50 because the limit has to fit the worst fix in the
+# category, not the typical one. Parameterising a SQL query or wrapping a URL in
+# an allowlist is a handful of lines, but removing an eval() means restructuring
+# the call site — measured at 73 and 79 lines on two independent attempts at the
+# same alert, so at 50 that whole class of finding could never pass.
+_DIFF_LIMITS = {"sast": 100, "iac": 50, "secret": 50, "cve": 200}
 
 _SECRET_PATTERNS = [
     r'(?i)(api_?key|password|secret|token)\s*[=:]\s*["\'][^"\']{8,}["\']',
@@ -153,7 +207,8 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
         alert_json=json.dumps(alert, indent=2),
         diff_text=diff_text,
     )
-    cmd = ["claude", "-p", prompt, "--output-format", "json", "--max-turns", "1"]
+    cmd = ["claude", "-p", prompt, *_SINGLE_SHOT_TOOL_FLAGS,
+           "--output-format", "json", "--max-turns", str(_SINGLE_SHOT_MAX_TURNS)]
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
@@ -163,10 +218,10 @@ def llm_validate(alert: dict, worktree_path: Path, timeout_sec: int = 90) -> Val
                                 failures=["LLM validation timed out — flagged for human review"])
 
     if result.returncode != 0:
-        stderr = result.stderr[:500] if result.stderr else "(no stderr)"
-        print(f"[WARN] LLM validation failed (exit={result.returncode}): {stderr}")
+        detail = _subprocess_error_detail(result)
+        print(f"[WARN] LLM validation failed (exit={result.returncode}): {detail}")
         return ValidationResult(passed=True, phase="llm", needs_review=True,
-                                failures=[f"LLM validation errored (exit={result.returncode}): {stderr}"])
+                                failures=[f"LLM validation errored (exit={result.returncode}): {detail}"])
 
     return _parse_llm(result.stdout)
 
@@ -316,6 +371,17 @@ def _check_python(files: list[str], cwd: Path) -> ValidationResult:
 # Phase 4: GitHub CI gate (called after PR is opened)
 # ---------------------------------------------------------------------------
 
+def has_no_ci_checks(stdout: str, stderr: str) -> bool:
+    """True when the PR simply has no checks configured.
+
+    `gh pr checks` exits 1 both for "a check went red" and for "this repo has no
+    CI at all", printing `no checks reported on the '<branch>' branch` to stderr
+    in the second case. They are not the same outcome: a repo without CI has
+    nothing to gate on, exactly like `gh` being absent.
+    """
+    return "no checks reported" in (stdout + stderr).lower()
+
+
 def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
     """Poll GitHub required checks. Uses `gh pr checks --watch`."""
     try:
@@ -330,8 +396,17 @@ def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
         return ValidationResult(passed=True, phase="ci")  # gh not available
 
     if result.returncode != 0:
+        if has_no_ci_checks(result.stdout, result.stderr):
+            print("[INFO] no CI checks configured on this PR — nothing to gate on",
+                  flush=True)
+            return ValidationResult(passed=True, phase="ci", needs_review=True)
         failed_lines = [l for l in result.stdout.splitlines() if "fail" in l.lower()]
-        reason = "; ".join(failed_lines[:3]) if failed_lines else result.stdout[:200]
+        # Fall back to stderr: gh reports several failure modes there with an
+        # empty stdout, which produced a bare "CI checks failed: " with no cause.
+        reason = ("; ".join(failed_lines[:3])
+                  or result.stdout.strip()[:200]
+                  or result.stderr.strip()[:200]
+                  or f"gh pr checks exited {result.returncode}")
         return ValidationResult(passed=False, phase="ci",
                                 failures=[f"CI checks failed: {reason}"])
 
@@ -416,6 +491,7 @@ def orca_check_gate(
     check_name: str = "orca-security-us",
     timeout_sec: int = 600,
     poll_interval: int = 15,
+    on_not_found: str = "skip",
 ) -> ValidationResult:
     """Poll the Orca GitHub App check on a PR.
 
@@ -423,6 +499,12 @@ def orca_check_gate(
     - passed=True if the check succeeded/neutral or was not found after grace period
     - passed=False if the check completed with failure, with structured findings in failures
     - needs_review=True when the check was skipped or not found
+
+    on_not_found: "skip" (default) passes when the check never appears, so a repo
+                  without the Orca App still gets its PR. "fail" blocks instead —
+                  for setups where a missing check means the gate silently did
+                  nothing. Previously this setting existed in config.py and the
+                  docs but was never read, so "fail" behaved as "skip".
     """
     try:
         owner_repo, _ = _parse_pr_url(pr_url)
@@ -444,10 +526,11 @@ def orca_check_gate(
 
         if run is None:
             if time.monotonic() > grace_deadline:
-                # Check never appeared — skip gracefully
-                print(f"[INFO] Orca check '{check_name}' not found on {sha[:8]}, skipping",
+                verb = "failing" if on_not_found == "fail" else "skipping"
+                print(f"[INFO] Orca check '{check_name}' not found on {sha[:8]}, {verb}",
                       flush=True)
-                return ValidationResult(passed=True, phase="orca_check", needs_review=True,
+                return ValidationResult(passed=(on_not_found != "fail"),
+                                        phase="orca_check", needs_review=True,
                                         failures=[f"Orca check '{check_name}' not found on PR"])
             time.sleep(poll_interval)
             continue

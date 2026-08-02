@@ -30,7 +30,8 @@ from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repositor
 from config import load_config, Config, OrcaCheckConfig
 from impact_agent import analyze_impact, ImpactResult
 from validator import (llm_validate, orca_check_gate, _parse_pr_url,
-                       OrcaCheckFinding, ValidationResult)
+                       OrcaCheckFinding, ValidationResult, ci_gate,
+                       has_no_ci_checks, _subprocess_error_detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1792,6 +1793,271 @@ class TestRevertClearsWorktree(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 24. Run outcome is visible to the caller
+# ---------------------------------------------------------------------------
+
+class TestExitCodeForResults(unittest.TestCase):
+    """A run that failed must not exit 0 — CI wrappers read that as green."""
+
+    def _t(self, state):
+        return AlertTask(alert_id="a", title="t", risk_level="high",
+                         feature_type="cve", source="f", alert_json={}, state=state)
+
+    CASES = [
+        ("no alerts", [], 0),
+        ("all done", ["DONE"], 0),
+        ("dry-run plan only", ["PENDING"], 0),
+        ("skipped is not a failure", ["SKIPPED"], 0),
+        ("done plus skipped", ["DONE", "SKIPPED"], 0),
+        ("one failure", ["FAILED"], 1),
+        ("timeout", ["TIMED_OUT"], 1),
+        # The PR exists but its checks are red. Reporting success would hide it.
+        ("ci failure", ["CI_FAILED"], 1),
+        ("failure among successes", ["DONE", "DONE", "FAILED"], 1),
+    ]
+
+    def test_exit_codes(self):
+        for desc, states, expected in self.CASES:
+            with self.subTest(desc):
+                tasks = [self._t(s) for s in states]
+                self.assertEqual(orchestrator.exit_code_for(tasks), expected)
+
+
+class TestRunSurfacesStdoutOnFailure(unittest.TestCase):
+    """_run must not discard the only diagnostic a subprocess produced.
+
+    run_agent.py reports errors as JSON on stdout and writes nothing to stderr,
+    so a stderr-only message degraded to a bare "Command failed: python3 …".
+    """
+
+    CASES = [
+        ("stderr preferred when present", "ignored stdout", "real stderr", "real stderr"),
+        ("falls back to stdout",
+         '{"error": "Alert orca-1 not found"}', "", "Alert orca-1 not found"),
+        ("whitespace-only stderr falls back", "stdout detail", "   \n", "stdout detail"),
+        ("both empty falls back to the command", "", "", "Command failed"),
+    ]
+
+    def test_error_message(self):
+        for desc, stdout, stderr, expected_substr in self.CASES:
+            with self.subTest(desc):
+                completed = subprocess.CompletedProcess(
+                    args=["python3", "run_agent.py"], returncode=1,
+                    stdout=stdout, stderr=stderr,
+                )
+                with patch("orchestrator.subprocess.run", return_value=completed):
+                    with self.assertRaises(RuntimeError) as ctx:
+                        orchestrator._run(["python3", "run_agent.py"])
+                self.assertIn(expected_substr, str(ctx.exception), desc)
+
+    def test_no_raise_when_check_false(self):
+        completed = subprocess.CompletedProcess(
+            args=["x"], returncode=1, stdout="out", stderr="err")
+        with patch("orchestrator.subprocess.run", return_value=completed):
+            stdout, stderr, rc = orchestrator._run(["x"], check=False)
+        self.assertEqual((stdout, stderr, rc), ("out", "err", 1))
+
+
+# ---------------------------------------------------------------------------
+# 25. Single-turn claude subprocesses must not be able to call tools
+# ---------------------------------------------------------------------------
+
+class TestSingleTurnAgentsRestrictTools(unittest.TestCase):
+    """--max-turns 1 without --allowedTools fails 100% of the time.
+
+    The model opens with a tool call, that consumes the only permitted turn, and
+    claude exits non-zero with subtype=error_max_turns and an empty stderr. Both
+    call sites then took their error path on every run: LLM validation passed
+    everything with needs_review, and every PR was labelled impact:medium.
+    """
+
+    def _captured_cmd(self, mock_run):
+        return mock_run.call_args[0][0]
+
+    def _assert_tools_restricted(self, cmd, label):
+        # --tools "" removes the tool definitions. --allowedTools "" only denies
+        # the calls, so the model still emits tool_use blocks and each refusal
+        # burns a turn — measured at 3 turns and 6.2x the cost per call, with a
+        # tail past any turn cap. Asserting the specific flag is the point.
+        self.assertIn("--tools", cmd, f"{label}: must disable tools, not just deny them")
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "",
+                         f"{label}: tool set must be empty")
+        self.assertNotIn("--allowedTools", cmd,
+                         f"{label}: --allowedTools is the flag that did not work")
+        self.assertIn("--max-turns", cmd, f"{label}: expected a turn cap")
+
+    @patch("validator.subprocess.run")
+    def test_llm_validate_restricts_tools(self, mock_run):
+        ok = subprocess.CompletedProcess(args=["claude"], returncode=0, stdout="{}", stderr="")
+        mock_run.return_value = ok
+        llm_validate({"alert_id": "a"}, Path("/tmp"))
+        self._assert_tools_restricted(self._captured_cmd(mock_run), "llm_validate")
+
+    @patch("impact_agent.subprocess.run")
+    def test_analyze_impact_restricts_tools(self, mock_run):
+        ok = subprocess.CompletedProcess(args=["claude"], returncode=0, stdout="{}", stderr="")
+        mock_run.return_value = ok
+        analyze_impact({"alert_id": "a"}, "diff --git a/f b/f")
+        self._assert_tools_restricted(self._captured_cmd(mock_run), "analyze_impact")
+
+
+# ---------------------------------------------------------------------------
+# 26. A repo without CI is not a CI failure
+# ---------------------------------------------------------------------------
+
+class TestHasNoCiChecks(unittest.TestCase):
+    """`gh pr checks` exits 1 both for a red check and for a repo with no CI."""
+
+    CASES = [
+        ("no checks, message on stderr", "",
+         "no checks reported on the 'fix/orca-1' branch", True),
+        ("no checks, message on stdout",
+         "no checks reported on the 'fix/orca-1' branch", "", True),
+        ("case insensitive", "", "No Checks Reported on the 'x' branch", True),
+        ("a real failure is not this", "build\tfail\t1m\thttps://…", "", False),
+        ("both empty", "", "", False),
+        ("passing checks", "build\tpass\t1m\thttps://…", "", False),
+    ]
+
+    def test_detection(self):
+        for desc, stdout, stderr, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(has_no_ci_checks(stdout, stderr), expected)
+
+
+class TestCiGateOutcomes(unittest.TestCase):
+    """The gate must distinguish "nothing to check" from "a check went red"."""
+
+    def _run(self, returncode, stdout="", stderr=""):
+        completed = subprocess.CompletedProcess(
+            args=["gh"], returncode=returncode, stdout=stdout, stderr=stderr)
+        with patch("validator.subprocess.run", return_value=completed):
+            return ci_gate("https://github.com/o/r/pull/1")
+
+    def test_cases(self):
+        CASES = [
+            ("all checks green", 0, "build\tpass", "", True, None),
+            # vulnerable-apps has no GitHub Actions at all, so every PR there
+            # was reported as a CI failure with an empty reason.
+            ("repo has no CI at all", 1, "",
+             "no checks reported on the 'fix/orca-1' branch", True, None),
+            ("a check went red", 1, "build\tfail\t1m", "", False, "build"),
+            # gh writes several failure modes to stderr with an empty stdout,
+            # which produced a bare "CI checks failed: " with no cause.
+            ("failure reported only on stderr", 1, "", "could not resolve PR",
+             False, "could not resolve PR"),
+            ("failure with no output at all", 1, "", "", False, "exited 1"),
+        ]
+        for desc, rc, stdout, stderr, should_pass, reason_substr in CASES:
+            with self.subTest(desc):
+                result = self._run(rc, stdout, stderr)
+                self.assertEqual(result.passed, should_pass, f"{desc}: passed")
+                if reason_substr:
+                    self.assertIn(reason_substr, "; ".join(result.failures), desc)
+
+    def test_no_ci_flags_for_review(self):
+        """Passing because there is no CI is not the same as passing CI."""
+        result = self._run(1, "", "no checks reported on the 'x' branch")
+        self.assertTrue(result.passed)
+        self.assertTrue(result.needs_review)
+
+
+# ---------------------------------------------------------------------------
+# 27. on_not_found is honoured, not just documented
+# ---------------------------------------------------------------------------
+
+class TestOrcaCheckOnNotFound(unittest.TestCase):
+    """The setting existed in config.py and SKILL.md but was never read."""
+
+    CASES = [
+        ("skip is the default and passes", "skip", True),
+        ("fail blocks instead", "fail", False),
+        ("unknown value behaves as skip", "something-else", True),
+    ]
+
+    def test_not_found_behaviour(self):
+        for desc, on_not_found, should_pass in self.CASES:
+            with self.subTest(desc):
+                # Jump straight past the 30s grace period, and stub sleep — the
+                # gate polls on a 15s cadence and would otherwise make the suite
+                # take a minute instead of milliseconds.
+                with patch("validator._parse_pr_url", return_value=("o/r", 1)), \
+                     patch("validator._get_pr_head_sha", return_value="a" * 40), \
+                     patch("validator._find_orca_check_run", return_value=None), \
+                     patch("validator.time.sleep"), \
+                     patch("validator.time.monotonic", side_effect=[0, 0, 1, 100]):
+                    result = orca_check_gate("https://github.com/o/r/pull/1",
+                                             check_name="Orca Security",
+                                             on_not_found=on_not_found)
+                self.assertEqual(result.passed, should_pass, desc)
+                self.assertTrue(result.needs_review, f"{desc}: always flag for review")
+
+    def test_orchestrator_passes_config_through(self):
+        """A config value that never reaches the gate is the bug we just fixed."""
+        import inspect
+        src = inspect.getsource(orchestrator._run_pipeline)
+        self.assertIn("on_not_found=orca_cfg.on_not_found", src)
+
+
+class TestSubprocessErrorDetail(unittest.TestCase):
+    """claude reports its own failures on stdout; stderr-only logging lost them."""
+
+    CASES = [
+        ("stderr wins when present", "stdout stuff", "boom", "boom"),
+        ("no output at all", "", "", "(no output)"),
+        ("plain stdout passed through", "something broke", "", "something broke"),
+        # The field that actually names the failure.
+        ("json envelope surfaces subtype",
+         '{"is_error": true, "subtype": "error_max_turns", "num_turns": 2}', "",
+         "error_max_turns"),
+        ("json envelope with error key",
+         '{"error": "Alert not found"}', "", "Alert not found"),
+        ("malformed json falls back to raw", "{not json", "", "{not json"),
+    ]
+
+    def test_detail(self):
+        for desc, stdout, stderr, expected_substr in self.CASES:
+            with self.subTest(desc):
+                completed = subprocess.CompletedProcess(
+                    args=["claude"], returncode=1, stdout=stdout, stderr=stderr)
+                self.assertIn(expected_substr, _subprocess_error_detail(completed), desc)
+
+
+# ---------------------------------------------------------------------------
+# 28. The impact assessment has exactly one home
+# ---------------------------------------------------------------------------
+
+class TestNoDuplicateImpactRendering(unittest.TestCase):
+    """Impact belongs in the PR body only.
+
+    It used to be rendered twice — once into the PR body by _commit_and_pr, and
+    again as a PR comment on fix_succeeded — so every PR carried the same
+    manual_steps and concerns in both places. Impact is computed before the PR
+    is opened, so the comment could never add anything.
+    """
+
+    def test_no_pr_comment_backend_registered(self):
+        from notifier import build_notifiers
+        names = [type(b).__name__ for b in build_notifiers("o/r", Path("/tmp")).backends]
+        self.assertNotIn("GitHubPRCommentNotifier", names)
+        for n in names:
+            self.assertNotIn("Comment", n, f"{n} would re-introduce the duplicate")
+
+    def test_notifier_never_shells_out_to_gh_pr_comment(self):
+        """Catches a backend that posts a comment without 'Comment' in its name."""
+        import notifier
+        self.assertNotIn("pr\", \"comment", Path(notifier.__file__).read_text())
+
+    def test_pr_body_still_carries_the_assessment(self):
+        """Dropping the comment must not drop the content — the body keeps it."""
+        import inspect
+        src = inspect.getsource(orchestrator._commit_and_pr)
+        for fragment in ("Required Manual Steps", "Reviewer Concerns",
+                         "impact.manual_steps", "impact.concerns"):
+            self.assertIn(fragment, src, f"PR body lost {fragment}")
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -1832,6 +2098,14 @@ if __name__ == "__main__":
         TestWorktreeTeardownGuaranteed,
         TestWorktreeConflictClassification,
         TestRevertClearsWorktree,
+        TestExitCodeForResults,
+        TestRunSurfacesStdoutOnFailure,
+        TestSingleTurnAgentsRestrictTools,
+        TestHasNoCiChecks,
+        TestCiGateOutcomes,
+        TestOrcaCheckOnNotFound,
+        TestSubprocessErrorDetail,
+        TestNoDuplicateImpactRendering,
     ]
 
     for cls in test_classes:
