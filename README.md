@@ -53,7 +53,10 @@ export NOTIFY_WEBHOOK_URL="https://hooks.slack.com/..."
 
 ## Usage
 
-After installing, the skill is namespaced under `security-engineer:`:
+Three entry points, one flag grammar. Flags are the contract; English is a
+convenience layer on top of them.
+
+### Slash command — explicit flags, taken exactly as typed
 
 ```
 # Fix mode — remediate alerts
@@ -61,6 +64,7 @@ After installing, the skill is namespaced under `security-engineer:`:
 /security-engineer:run high,cve                     → high+ CVEs only
 /security-engineer:run --alert orca-270453          → fix a single alert
 /security-engineer:run --dry-run cve                → plan only, no git ops
+/security-engineer:run --max 3 cve                  → cap at 3 CVE fixes
 /security-engineer:run --remote owner/repo          → clone and fix a remote repo
 /security-engineer:run --remote all                 → fix all Orca-discovered repos
 
@@ -70,6 +74,35 @@ After installing, the skill is namespaced under `security-engineer:`:
 /security-engineer:run --scan --remote owner/repo   → list risks for a remote repo
 /security-engineer:run --scan --remote all          → list risks across all repos
 ```
+
+### Shell — the same flags, outside Claude Code
+
+Installing the plugin puts `security-engineer` on your `PATH`, so every example
+above also works in a terminal, a Makefile, or CI:
+
+```bash
+security-engineer high,cve --max 3
+security-engineer --scan --remote all
+```
+
+### Plain English — translated to those same flags
+
+Just describe what you want. The skill resolves the intent, echoes the command
+it derived, and runs it once:
+
+```
+"remediate alert-192901290"                 → security-engineer --alert alert-192901290
+"remediate all high vulnerabilities, max of 3"
+                                            → security-engineer high --max 3
+"fix one SAST issue"                        → security-engineer sast --max 1
+"show me what you'd do about the CVEs"      → security-engineer cve --dry-run
+"what security risks does this repo have?"  → security-engineer --scan
+```
+
+Alert IDs are accepted however you write them — `alert-192901290`, `#192901290`,
+or a bare `192901290` all resolve to Orca's `orca-192901290`. If a message
+contains explicit flags, they are passed through untouched rather than
+re-interpreted.
 
 ## CVE version decisions
 
@@ -121,6 +154,8 @@ check and CI gates catch regressions.
 
 ```
 .claude-plugin/plugin.json   → plugin manifest
+bin/security-engineer        → CLI entry point (plugin bin/ is added to PATH)
+commands/run.md              → /security-engineer:run slash command
 skills/
   security-engineer/         → orchestrator, validator, agents, notifier
     fix-agents/              → fix instructions per vulnerability type (cve, sast, iac, secret)

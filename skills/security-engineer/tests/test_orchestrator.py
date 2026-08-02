@@ -171,6 +171,91 @@ class TestFlagValidation(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 1bb. Alert ID normalization
+#
+# The skill can now be reached in plain English ("remediate alert-192901290"),
+# so --alert receives whatever shape the human typed, not just the canonical
+# orca-<digits> that the Orca API echoes back.
+# ---------------------------------------------------------------------------
+
+class TestNormalizeAlertId(unittest.TestCase):
+
+    CASES = [
+        ("canonical id is unchanged",        "orca-4060720",  "orca-4060720"),
+        ("normalization is idempotent",      "orca-orca-1",   "orca-orca-1"),
+        ("alert- prefix is rewritten",       "alert-192901290", "orca-192901290"),
+        ("alert_ prefix is rewritten",       "alert_192901290", "orca-192901290"),
+        ("'alert ' prefix is rewritten",     "alert 192901290", "orca-192901290"),
+        ("hash prefix is rewritten",         "#192901290",    "orca-192901290"),
+        ("bare digits get the prefix",       "192901290",     "orca-192901290"),
+        ("prefix casing does not matter",    "ALERT-4060720", "orca-4060720"),
+        ("surrounding whitespace is dropped", "  orca-4060720  ", "orca-4060720"),
+        ("non-numeric body passes through",  "orca-abc123",   "orca-abc123"),
+        ("unknown scheme passes through",    "ORCA_CUSTOM/77", "ORCA_CUSTOM/77"),
+        ("None passes through",              None,            None),
+        ("empty string passes through",      "",              ""),
+    ]
+
+    def test_normalize(self):
+        from orca_client import normalize_alert_id
+        for desc, raw, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(normalize_alert_id(raw), expected)
+
+    MAIN_CASES = [
+        ("alert- form reaches the pipeline canonical", "alert-192901290", "orca-192901290"),
+        ("bare digits reach the pipeline canonical",   "192901290",       "orca-192901290"),
+        ("canonical form is left alone",               "orca-4060720",    "orca-4060720"),
+    ]
+
+    def test_main_canonicalizes_before_dispatch(self):
+        """main() normalizes at the CLI boundary, not just inside the API call.
+
+        Everything downstream — the plan table, the worktree path, the notifier
+        — reads args.alert, so the rewrite has to land before dispatch. Asserted
+        on the args object _fetch_and_plan actually receives.
+        """
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+        for desc, raw, expected in self.MAIN_CASES:
+            with self.subTest(desc):
+                with patch.object(orchestrator, "_detect_repo", return_value=repo), \
+                     patch.object(orchestrator, "build_notifiers"), \
+                     patch.object(orchestrator, "_print_plan"), \
+                     patch.object(orchestrator, "_fetch_and_plan",
+                                  return_value=([], [], [], [])) as plan:
+                    main(["--alert", raw])
+                    plan.assert_called_once()
+                    self.assertEqual(plan.call_args[0][0].alert, expected)
+
+
+# ---------------------------------------------------------------------------
+# 1bc. Setup failures exit with a message, not a traceback
+# ---------------------------------------------------------------------------
+
+class TestLocalFetchFailureIsReported(unittest.TestCase):
+    """A missing token reaching a plain-English user must not be a traceback."""
+
+    CASES = [
+        ("missing token", "Error: set ORCA_API_TOKEN env var"),
+        ("api outage",    "Orca API returned 503"),
+    ]
+
+    def test_fetch_failure_exits_cleanly(self):
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+        for desc, detail in self.CASES:
+            with self.subTest(desc):
+                with patch.object(orchestrator, "_detect_repo", return_value=repo), \
+                     patch.object(orchestrator, "build_notifiers"), \
+                     patch.object(orchestrator, "_fetch_and_plan",
+                                  side_effect=RuntimeError(detail)):
+                    with self.assertRaises(SystemExit) as ctx:
+                        main([])
+                    message = str(ctx.exception)
+                    self.assertIn(detail, message)
+                    self.assertIn("owner/repo", message)
+
+
+# ---------------------------------------------------------------------------
 # 1c. Scan report output
 # ---------------------------------------------------------------------------
 
@@ -2114,6 +2199,8 @@ if __name__ == "__main__":
         TestOrcaCheckOnNotFound,
         TestSubprocessErrorDetail,
         TestNoDuplicateImpactRendering,
+        TestNormalizeAlertId,
+        TestLocalFetchFailureIsReported,
     ]
 
     for cls in test_classes:

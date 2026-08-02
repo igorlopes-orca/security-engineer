@@ -27,7 +27,7 @@ sys.path.insert(0, str(_THIS_DIR))
 
 from orca_client import (RISK_ORDER, alert_branch_name, Repository,
                          list_repositories, get_token, fetch_alerts,
-                         _resolve_feature_type)
+                         normalize_alert_id, _resolve_feature_type)
 
 from _json_util import find_last_json_with_key
 from config import load_config
@@ -1342,6 +1342,12 @@ def main(argv=None):
                         help="[filter_tokens] e.g. 'high,sast' or 'cve'")
     args = parser.parse_args(argv)
 
+    # Canonicalize here, at the CLI boundary, and not only inside
+    # fetch_alert_by_id: the raw value also reaches the plan table, the worktree
+    # path and the notifier, so an ID typed as "alert-192901290" would otherwise
+    # be reported back under a name Orca never uses.
+    args.alert = normalize_alert_id(args.alert)
+
     # All positional tokens are filter tokens — repo is always auto-detected from git remote
     args.repo = None
     args.filter_tokens = None
@@ -1387,7 +1393,15 @@ def main(argv=None):
     if args.dry_run:
         print("Mode: DRY-RUN — fix agents will read files and plan fixes, cannot edit.")
 
-    to_fix, skipped, scm_posture, unfixable = _fetch_and_plan(args, repo)
+    # A missing token or an Orca API outage is a setup problem, not a crash. The
+    # remote paths already exit with a message; local raised a bare traceback,
+    # which is a poor first thing to show someone who reached this by asking in
+    # plain English.
+    try:
+        to_fix, skipped, scm_posture, unfixable = _fetch_and_plan(args, repo)
+    except RuntimeError as e:
+        sys.exit(f"Error: could not fetch alerts for {repo.name}: {e}")
+
     _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run)
 
     if not to_fix:
