@@ -220,8 +220,34 @@ def _bounded(value, limit=_PASSTHROUGH_LIMIT):
     return value
 
 
+_ALERT_ID_PREFIXES = ("orca-", "alert-", "alert_", "alert ", "#")
+
+
+def normalize_alert_id(alert_id):
+    """Coerce however a human wrote an alert ID into Orca's canonical form.
+
+    Orca mints IDs as `orca-<digits>`, but a request arriving in plain English
+    says "remediate alert-192901290", "fix #192901290", or just the number. Only
+    a purely numeric remainder is re-prefixed: anything else is passed through
+    untouched, so a genuinely different ID scheme still reaches the API and
+    fails there with its own name in the error rather than a mangled one.
+
+    Idempotent — canonical IDs coming back out of Orca survive a second pass.
+    """
+    if not alert_id:
+        return alert_id
+    candidate = str(alert_id).strip()
+    lowered = candidate.lower()
+    for prefix in _ALERT_ID_PREFIXES:
+        if lowered.startswith(prefix):
+            candidate = candidate[len(prefix):].strip()
+            break
+    return f"orca-{candidate}" if candidate.isdigit() else str(alert_id).strip()
+
+
 def fetch_alert_by_id(alert_id, token):
     """Fetch a single alert by ID. Returns normalized dict or None."""
+    alert_id = normalize_alert_id(alert_id)
     payload = {
         "query": {
             "models": ["Alert"],

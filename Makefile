@@ -23,6 +23,7 @@ install:
 	@test -d "$(PLUGIN_CACHE)" || (echo "Plugin not installed. Run install.sh first." && exit 1)
 	rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='security-engineer-run.json' skills/ "$(PLUGIN_CACHE)/skills/"
 	rsync -a commands/ "$(PLUGIN_CACHE)/commands/"
+	rsync -a bin/ "$(PLUGIN_CACHE)/bin/"
 	rm -f "$(PLUGIN_CACHE)/.claude-plugin/marketplace.json"
 	find "$(PLUGIN_CACHE)" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	@echo "Installed v$(VERSION) to plugin cache. Restart Claude Code or run /reload-plugins."

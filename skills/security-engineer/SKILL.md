@@ -1,49 +1,132 @@
 ---
-name: run
-description: Autonomous security agent that fixes Orca security alerts (CVE/SCA, SAST, IaC, secrets) — validates each fix, analyzes production impact, opens PRs, and notifies. Use whenever the user wants to fix, remediate, patch, or triage Orca alerts or vulnerabilities, or scan a repo for security findings — including phrases like "fix the sast issues", "remediate one CVE", "patch the high-severity alerts", "scan this repo", or "run the security engineer". Translates natural-language intent (severity, finding type, count, dry-run, remote repo) into orchestrator flags.
+name: security-engineer
+description: Remediate Orca Security alerts end to end — fix, validate, assess production impact, open a PR, notify. Use whenever someone asks to fix, remediate, patch, triage, or scan security alerts, vulnerabilities, or findings, whether they name a severity ("remediate all high vulnerabilities", "patch the critical ones"), a type ("fix the SAST issues", "clean up the hardcoded secrets", "bump the vulnerable dependencies", "fix the Dockerfile findings"), a count ("just one", "max of 3"), an alert ID ("remediate alert-192901290", "fix orca-4060720"), or a repo ("fix everything in owner/repo", "scan all our repos"). Also covers dry runs and read-only risk reports. Covers CVE/SCA, SAST, IaC, and secret findings.
 argument-hint: "[risk_levels,feature_types] [--scan] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
 allowed-tools: Bash
 ---
 
-# Security Engineer Agent
+# Security Engineer
 
-```bash
-python3 ${CLAUDE_SKILL_DIR}/orchestrator.py $ARGUMENTS
+A Python orchestrator does the remediation. Your job is narrow: **turn the
+request into one command line, echo it, run it once, report what it printed.**
+Never fix an alert yourself, and never run the command more than once.
+
+## 0. Flags win over interpretation
+
+There are two ways in, and they end at the same command:
+
+| The user typed | What you do |
+|---|---|
+| Flags — `/security-engineer:run high,cve --max 3`, or any message containing `--scan`, `--dry-run`, `--alert`, `--max`, `--remote`, or a bare filter token like `high,cve` | **Pass them through verbatim.** Do not re-derive, reorder, add, or drop a single flag. |
+| Plain English — "remediate all high vulnerabilities with max of 3" | Translate with the tables in §1. |
+
+If a message mixes both — "fix the high CVEs, `--dry-run`" — the explicit flag is
+authoritative and the English fills in only what no flag covers. Never override
+something the user spelled out, and never silently add a flag they did not ask
+for (especially `--max`, which would quietly shrink the run).
+
+## 1. Build the command
+
+```
+security-engineer [FILTER] [FLAGS]
 ```
 
-Return the output verbatim. If the script exits with a non-zero exit code, print the error and STOP — do not retry, do not correct arguments, do not attempt to fix the command on the user's behalf.
+`security-engineer` is on `PATH` — Claude Code adds every installed plugin's
+`bin/` directory. If the shell answers `command not found`, the plugin is not
+installed: say so and stop. Do not go hunting for `orchestrator.py`.
 
-## Translating natural language to flags
+It takes exactly the flags documented in the Usage Reference below, so anything
+valid after `/security-engineer:run` is valid after `security-engineer`.
 
-When invoked from plain English (not a `/security-engineer:run` slash command), build
-`$ARGUMENTS` from the request using this mapping, then run the orchestrator exactly once:
+**FILTER** is a single positional token: severity and type joined by a comma,
+no spaces (`high`, `cve`, `high,cve`, `critical,sast`). Severity is cumulative —
+`high` means critical *and* high. Type is exact. Omit it for everything.
 
-| User says… | Flags |
+| Intent | Token |
 |---|---|
-| "fix one sast alert", "fix a single SAST issue" | `sast --max 1` |
-| "remediate one CVE" | `cve --max 1` |
-| "patch the high-severity alerts" | `high` |
-| "fix critical SAST findings" | `critical,sast` |
-| "fix the secrets" / "fix IaC issues" | `secret` / `iac` |
-| "just show me what it would do" / "dry run" | append `--dry-run` |
-| "scan this repo" / "don't fix, just report" | `--scan` |
-| "fix alert orca-385591" | `--alert orca-385591` |
-| "fix alerts in owner/repo" | `--remote owner/repo` |
-| "fix everything" / no qualifier | (no flags) |
+| critical / high / medium / low | `critical` `high` `medium` `low` |
+| CVEs, SCA, vulnerable dependencies, package/library versions | `cve` |
+| SAST, source code vulnerabilities, insecure code | `sast` |
+| IaC, Dockerfile, Kubernetes, Terraform | `iac` |
+| hardcoded secrets, leaked credentials, exposed keys | `secret` |
 
-Rules:
-- Severity words (`critical`/`high`/`medium`/`low`) and types (`sast`/`iac`/`cve`/`secret`)
-  combine comma-separated with no spaces: `critical,sast`.
-- "one" / "a single" / "just one" → `--max 1`; "two", "three" → `--max 2`, `--max 3`.
-- If the request is ambiguous about scope (which severity/type), ask before running —
-  do not guess and launch a broad fix run.
-- Echo the resolved command to the user before executing, e.g. `→ orchestrator.py sast --max 1`.
+**FLAGS**
+
+| Intent | Flag |
+|---|---|
+| "just one", "a single", "only one" | `--max 1` |
+| "max of 3", "up to 3", "at most three", "3 of them" | `--max 3` |
+| "dry run", "plan it", "show me what it would do", "don't change anything" | `--dry-run` |
+| "scan", "list the risks", "what's open", "report only, don't fix" | `--scan` |
+| a specific alert | `--alert orca-4060720` |
+| "in owner/repo", "against owner/repo" | `--remote owner/repo` |
+| "all our repos", "every repo", "org-wide" | `--remote all` |
+
+### Worked examples
+
+| Request | Command |
+|---|---|
+| "remediate alert-192901290" | `security-engineer --alert alert-192901290` |
+| "remediate all high vulnerabilities with max of 3" | `security-engineer high --max 3` |
+| "fix one SAST issue" | `security-engineer sast --max 1` |
+| "patch the critical CVEs" | `security-engineer critical,cve` |
+| "clean up the hardcoded secrets" | `security-engineer secret` |
+| "show me what you'd do about the CVEs" | `security-engineer cve --dry-run` |
+| "what security risks does this repo have?" | `security-engineer --scan` |
+| "list the high risks across all our repos" | `security-engineer --scan --remote all` |
+| "fix at most two high CVEs in acme/api" | `security-engineer high,cve --remote acme/api --max 2` |
+
+### Rules
+
+- **Alert IDs pass through as the user typed them.** `alert-192901290`,
+  `#192901290`, and a bare `192901290` are all normalized to Orca's canonical
+  `orca-192901290` by the orchestrator. Do not rewrite them yourself, and do not
+  ask the user to reformat.
+- **"vulnerabilities" alone is not `cve`.** Used loosely it means all finding
+  types — pass no type token. Only use `cve` when the request points at
+  packages, dependencies, libraries, CVE numbers, or SCA.
+- **Never add `--remote` when the user is working in the current repo.** With no
+  `--remote`, the orchestrator auto-detects the repo from the git remote.
+- **`--scan` is read-only** and rejects `--dry-run`, `--alert`, and `--max`. If
+  the user wants a report about one alert, drop `--scan`.
+- **Ask first only when a *fix* run is completely unbounded** — no severity, no
+  type, no count, no alert ID. That fixes every open alert in the repo and opens
+  a PR per alert, so confirm scope before launching it. Anything narrower: run it.
+
+## 2. Echo, then run
+
+Print the resolved command before executing, so the user can see how their
+words were read:
+
+```
+→ security-engineer high --max 3
+```
+
+Then run it exactly once, in the foreground. A full run takes minutes and prints
+progress as it goes — that is expected, not a hang. Use a Bash timeout of at
+least 30 minutes for a fix run.
+
+## 3. Report
+
+Return the orchestrator's output verbatim, including its summary table. If it
+exits non-zero, print the error and **stop** — do not retry, do not adjust the
+arguments, do not attempt the fix by hand. A non-zero exit means a gate did its
+job; second-guessing it is how a bad fix reaches a PR.
 
 ---
 
 ## Usage Reference
 
 Two modes: **fix** (default) and **scan** (`--scan`).
+
+Three interchangeable entry points, one flag grammar — this reference applies to
+all three:
+
+```
+/security-engineer:run high,cve --max 3     # slash command
+security-engineer high,cve --max 3          # shell, or what this skill runs
+"fix up to 3 high CVEs"                     # plain English, translated per §1
+```
 
 ### Fix mode — remediate alerts
 
@@ -120,7 +203,8 @@ Three independent enforcement layers:
 2. **Orchestrator gate** — returns immediately after fix plan; validation, commit, and PR steps are never reached
 3. **Commit guard** — `_commit_and_pr()` also checks dry_run as defense in depth
 
-Run `python3 ${CLAUDE_SKILL_DIR}/tests/test_orchestrator.py` to verify all flags are enforced correctly.
+The unit suite at `skills/security-engineer/tests/test_orchestrator.py` (inside the
+plugin directory) verifies all three layers.
 
 ## Pipeline (Live Mode)
 
@@ -252,11 +336,12 @@ from the manifest filename in the alert's `source`; the package name is whicheve
 manifest entry the alert's prose names, cross-checked against the manifest, which
 is the authority. Per-ecosystem agent instructions live in `fix-agents/cve/`.
 
-**Inspect a decision by hand** — no Orca token or alert needed:
+**Inspect a decision by hand** — no Orca token or alert needed. `run_agent.py`
+sits beside `orchestrator.py` in the plugin's `skills/security-engineer/`:
 
 ```bash
-python3 ${CLAUDE_SKILL_DIR}/run_agent.py resolve-version pypi pillow 8.3.1
-python3 ${CLAUDE_SKILL_DIR}/run_agent.py resolve-version ./app/requirements.txt requests 2.20.0
+python3 run_agent.py resolve-version pypi pillow 8.3.1
+python3 run_agent.py resolve-version ./app/requirements.txt requests 2.20.0
 ```
 
 The same rationale, cleared advisories and reproduce command appear in the PR body.
