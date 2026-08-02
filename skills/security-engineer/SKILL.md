@@ -1,6 +1,6 @@
 ---
 name: run
-description: Autonomous security agent — Python orchestrator fixes Orca alerts with validation, impact analysis, and notifications
+description: Autonomous security agent that fixes Orca security alerts (CVE/SCA, SAST, IaC, secrets) — validates each fix, analyzes production impact, opens PRs, and notifies. Use whenever the user wants to fix, remediate, patch, or triage Orca alerts or vulnerabilities, or scan a repo for security findings — including phrases like "fix the sast issues", "remediate one CVE", "patch the high-severity alerts", "scan this repo", or "run the security engineer". Translates natural-language intent (severity, finding type, count, dry-run, remote repo) into orchestrator flags.
 argument-hint: "[risk_levels,feature_types] [--scan] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
 allowed-tools: Bash
 ---
@@ -12,6 +12,32 @@ python3 ${CLAUDE_SKILL_DIR}/orchestrator.py $ARGUMENTS
 ```
 
 Return the output verbatim. If the script exits with a non-zero exit code, print the error and STOP — do not retry, do not correct arguments, do not attempt to fix the command on the user's behalf.
+
+## Translating natural language to flags
+
+When invoked from plain English (not a `/security-engineer:run` slash command), build
+`$ARGUMENTS` from the request using this mapping, then run the orchestrator exactly once:
+
+| User says… | Flags |
+|---|---|
+| "fix one sast alert", "fix a single SAST issue" | `sast --max 1` |
+| "remediate one CVE" | `cve --max 1` |
+| "patch the high-severity alerts" | `high` |
+| "fix critical SAST findings" | `critical,sast` |
+| "fix the secrets" / "fix IaC issues" | `secret` / `iac` |
+| "just show me what it would do" / "dry run" | append `--dry-run` |
+| "scan this repo" / "don't fix, just report" | `--scan` |
+| "fix alert orca-385591" | `--alert orca-385591` |
+| "fix alerts in owner/repo" | `--remote owner/repo` |
+| "fix everything" / no qualifier | (no flags) |
+
+Rules:
+- Severity words (`critical`/`high`/`medium`/`low`) and types (`sast`/`iac`/`cve`/`secret`)
+  combine comma-separated with no spaces: `critical,sast`.
+- "one" / "a single" / "just one" → `--max 1`; "two", "three" → `--max 2`, `--max 3`.
+- If the request is ambiguous about scope (which severity/type), ask before running —
+  do not guess and launch a broad fix run.
+- Echo the resolved command to the user before executing, e.g. `→ orchestrator.py sast --max 1`.
 
 ---
 
@@ -105,11 +131,15 @@ Operates on the repo you're already inside — no cloning.
 ```
 For each alert (up to 4 in parallel, isolated git worktree per alert):
 
-  1. create_worktree        -> /tmp/orca-fix-<id>  (isolated branch)
+  1. create_worktree        -> /tmp/orca-fix-<owner>-<repo>-<id>  (isolated branch)
+                              clears leftovers from a crashed run; refuses to
+                              delete a branch holding commits (skips instead)
   2. invoke_fix_agent       -> claude subprocess, --allowedTools Read,Edit,Write,Bash
                               timeout: sast=180s, iac/secret=120s, cve=240s
                               retries: up to 2 on json_parse / subprocess errors
   3. validate (Phase 1)     -> Python: diff non-empty, diff size, no new secrets
+                              diff = `git add -A -N` + `git diff`, so created
+                              files count; size limit keyed on resolved type
   4. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
   5. validate (Phase 3)     -> Local build (see Language Coverage below)
   6. impact_agent           -> claude subprocess: analyze diff -> production risk JSON
@@ -118,7 +148,8 @@ For each alert (up to 4 in parallel, isolated git worktree per alert):
   9. validate (Phase 4)     -> Orca check gate (see Orca Check Gate below)
  10. validate (Phase 5)     -> CI gate: gh pr checks --watch (timeout: 10min)
  11. notify                 -> console + log file + GitHub PR comment
- 12. remove_worktree        -> cleanup /tmp/orca-fix-<id> + local branch
+ 12. remove_worktree        -> cleanup worktree + local branch (runs in a finally,
+                              so it happens on every exit path incl. exceptions)
 ```
 
 ### Remote mode (`--remote owner/repo` or `--remote all`)
