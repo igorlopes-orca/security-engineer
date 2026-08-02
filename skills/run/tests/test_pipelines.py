@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tests for the per-type fix pipelines (skills/security-engineer/pipelines/).
+Tests for the per-type fix pipelines (skills/run/pipelines/).
 
 Two things are being protected here:
 

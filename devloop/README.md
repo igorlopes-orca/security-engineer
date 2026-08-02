@@ -35,7 +35,39 @@ make loop ARGS="sast --max 2"    # any orchestrator filter
 make reset                       # sandbox back to clean, on its own
 make run ARGS="--scan"           # a run without the reset/report wrapper
 make observe                     # re-report on the newest run, any time
+
+make install                     # install this working tree as the plugin
+make uninstall                   # remove it; marketplace goes back to GitHub
+make plugin-status               # is the installed plugin this code?
 ```
+
+## The dev loop and the skill test the same code
+
+Two entry points reach the orchestrator, and they do not share a copy of it:
+
+| Entry point | Runs |
+|---|---|
+| `devloop/run.sh`, `make run` | `skills/run/orchestrator.py` in this repo — uncommitted edits included |
+| `/security-engineer:run` | the copy in `~/.claude/plugins/cache/`, made when the plugin was installed |
+
+Nothing refreshes that copy on its own. `claude plugin update` short-circuits
+while `plugin.json`'s version is unchanged, and installing over an existing
+install is a no-op — so the installed skill keeps running the commit it went in
+at. On 2026-08-02 that was twelve commits back, and the dev loop was green the
+whole time, because the dev loop was never testing it.
+
+`make install` closes the gap: it points the `orca-security` marketplace at this
+directory, drops the old install, and copies the working tree in. `make loop`
+and `make fast` run it as a step, so the two entry points cannot silently
+diverge. A bare `devloop/run.sh` only warns — that run still tests the working
+tree, which is what the dev loop is for; only the skill is stale.
+
+`make uninstall` removes the plugin and puts the marketplace back on GitHub, so
+`./install.sh` reinstalls the published version. Use that before tagging a
+release, to check the packaged form the way a fresh clone would get it.
+
+Changes to Python take effect on the next invocation. Changes to `SKILL.md`
+frontmatter need a Claude Code restart to re-register.
 
 **Alert IDs are not stable.** Orca mints new ones every time it rescans, so a
 hardcoded ID eventually fails with `Alert <id> not found`. That is why `make

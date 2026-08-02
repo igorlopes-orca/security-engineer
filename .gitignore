@@ -7,7 +7,7 @@
 
 # Runtime logs
 security-engineer-run.json
-skills/security-engineer/security-engineer-run.json
+skills/run/security-engineer-run.json
 
 # Dev loop — captured runs and local secrets
 devloop/runs/

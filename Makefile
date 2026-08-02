@@ -1,32 +1,78 @@
 VERSION     := $(shell python3 -c "import json; print(json.load(open('.claude-plugin/plugin.json'))['version'])")
+MARKETPLACE := orca-security
+PLUGIN      := security-engineer@$(MARKETPLACE)
+ORIGIN      := igorlopes-orca/security-engineer
 PLUGIN_CACHE := $(HOME)/.claude/plugins/cache/orca-security/security-engineer/$(VERSION)
 
-.PHONY: test e2e all install validate reset run observe loop fast
+.PHONY: test e2e all install uninstall plugin-status validate reset run observe loop fast
 
 # Unit tests — no API token needed, no network, pure Python
 test:
-	python3 skills/security-engineer/tests/test_orchestrator.py
-	python3 skills/security-engineer/tests/test_version_data.py
-	python3 skills/security-engineer/tests/test_package_identity.py
-	python3 skills/security-engineer/tests/test_pipelines.py
+	python3 skills/run/tests/test_orchestrator.py
+	python3 skills/run/tests/test_version_data.py
+	python3 skills/run/tests/test_package_identity.py
+	python3 skills/run/tests/test_pipelines.py
 	python3 devloop/tests/test_observe.py
+	python3 devloop/tests/test_plugin_sync.py
 
 # Integration tests — requires ORCA_API_TOKEN
 e2e:
-	python3 skills/security-engineer/tests/test_e2e_orca.py
+	python3 skills/run/tests/test_e2e_orca.py
 
 # Run both
 all: test e2e
 
-# Copy local files to plugin cache for testing without pushing
+# Install this working tree as the plugin, so /security-engineer:run executes
+# the code you are editing.
+#
+# Without this the two entry points diverge. devloop/run.sh runs orchestrator.py
+# straight out of the repo, while the skill runs the copy Claude Code made when
+# the plugin was installed — and nothing refreshes that copy on its own:
+# `claude plugin update` short-circuits while plugin.json's version is
+# unchanged, and installing over an existing install is a no-op. So the skill
+# keeps running the commit it was installed at until you say otherwise.
+#
+# Three steps, none of them optional:
+#   marketplace add  points the orca-security marketplace at THIS directory
+#                    instead of GitHub, so "install" means "install what I have
+#                    here" rather than "download origin/main"
+#   uninstall        the no-op-on-reinstall rule means the old copy has to go
+#                    first, or nothing is refreshed. Ignored if not installed.
+#   install          copies the working tree into the plugin cache
+#
+# `make uninstall` puts the marketplace back on GitHub.
 install:
-	@test -d "$(PLUGIN_CACHE)" || (echo "Plugin not installed. Run install.sh first." && exit 1)
-	rsync -a --exclude='__pycache__' --exclude='*.pyc' --exclude='security-engineer-run.json' skills/ "$(PLUGIN_CACHE)/skills/"
-	rsync -a commands/ "$(PLUGIN_CACHE)/commands/"
-	rsync -a bin/ "$(PLUGIN_CACHE)/bin/"
-	rm -f "$(PLUGIN_CACHE)/.claude-plugin/marketplace.json"
-	find "$(PLUGIN_CACHE)" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	@echo "Installed v$(VERSION) to plugin cache. Restart Claude Code or run /reload-plugins."
+	@claude plugin marketplace add "$(CURDIR)" --scope user >/dev/null
+	@claude plugin uninstall $(PLUGIN) --scope user >/dev/null 2>&1 || true
+	@claude plugin install $(PLUGIN) --scope user
+	@python3 devloop/plugin_sync.py check
+	@echo "Installed v$(VERSION) from $(CURDIR)."
+	@echo "SKILL.md or frontmatter changes need a Claude Code restart to re-register."
+
+# Remove the plugin and put the marketplace back on GitHub.
+#
+# Uninstalls every scope the registry actually lists, each from its own
+# projectPath. A project-scoped entry is only visible to `claude plugin
+# uninstall` when the command runs from the directory it was installed from —
+# this plugin's is $HOME, not this repo — and getting that wrong leaves a
+# registry entry pointing at a cache directory this target then deletes.
+#
+# Uninstall also leaves the copied files behind, hence the rm.
+uninstall:
+	@python3 devloop/plugin_sync.py scopes | while IFS="$$(printf '\t')" read -r scope dir; do \
+	  cd "$${dir:-$(CURDIR)}" && claude plugin uninstall $(PLUGIN) --scope "$$scope" || true; \
+	done
+	@rm -rf "$(HOME)/.claude/plugins/cache/orca-security/security-engineer"
+	-@claude plugin marketplace add $(ORIGIN) --scope user >/dev/null
+	@python3 devloop/plugin_sync.py check || true
+	@echo "Removed $(PLUGIN); marketplace restored to $(ORIGIN)."
+	@echo "Reinstall the published version with ./install.sh, or this tree with 'make install'."
+
+# Is the installed plugin the code in this tree? Names the files if not.
+# Reports rather than fails — `make: *** Error 1` on a status query is noise.
+# The script itself still exits non-zero, which is what run.sh keys off.
+plugin-status:
+	@python3 devloop/plugin_sync.py check || true
 
 # Verify cached plugin is valid
 validate:
@@ -57,8 +103,13 @@ observe:
 
 # Full loop. Held together with && so a failing step stops the chain instead of
 # letting `observe` report on a run that never happened.
+#
+# `install` is in the chain so the skill and the dev loop never test different
+# code: the run exercises the working tree, and the install makes
+# /security-engineer:run agree with it. It costs a couple of seconds and it is
+# the only thing keeping the two entry points honest.
 loop:
-	$(MAKE) test && $(MAKE) reset && $(MAKE) run ARGS="$(ARGS)" && $(MAKE) observe
+	$(MAKE) test && $(MAKE) install && $(MAKE) reset && $(MAKE) run ARGS="$(ARGS)" && $(MAKE) observe
 
 # Single-alert loop — the fast iteration path.
 #

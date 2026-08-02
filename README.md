@@ -60,19 +60,19 @@ convenience layer on top of them.
 
 ```
 # Fix mode — remediate alerts
-/security-engineer:run                              → all fixable alerts
-/security-engineer:run high,cve                     → high+ CVEs only
-/security-engineer:run --alert orca-270453          → fix a single alert
-/security-engineer:run --dry-run cve                → plan only, no git ops
-/security-engineer:run --max 3 cve                  → cap at 3 CVE fixes
-/security-engineer:run --remote owner/repo          → clone and fix a remote repo
-/security-engineer:run --remote all                 → fix all Orca-discovered repos
+/security-engineer:script                              → all fixable alerts
+/security-engineer:script high,cve                     → high+ CVEs only
+/security-engineer:script --alert orca-270453          → fix a single alert
+/security-engineer:script --dry-run cve                → plan only, no git ops
+/security-engineer:script --max 3 cve                  → cap at 3 CVE fixes
+/security-engineer:script --remote owner/repo          → clone and fix a remote repo
+/security-engineer:script --remote all                 → fix all Orca-discovered repos
 
 # Scan mode — list risks without fixing
-/security-engineer:run --scan                       → list all risks for current repo
-/security-engineer:run --scan high                  → list high+ risks only
-/security-engineer:run --scan --remote owner/repo   → list risks for a remote repo
-/security-engineer:run --scan --remote all          → list risks across all repos
+/security-engineer:script --scan                       → list all risks for current repo
+/security-engineer:script --scan high                  → list high+ risks only
+/security-engineer:script --scan --remote owner/repo   → list risks for a remote repo
+/security-engineer:script --scan --remote all          → list risks across all repos
 ```
 
 ### Shell — the same flags, outside Claude Code
@@ -87,8 +87,9 @@ security-engineer --scan --remote all
 
 ### Plain English — translated to those same flags
 
-Just describe what you want. The skill resolves the intent, echoes the command
-it derived, and runs it once:
+Just describe what you want. The `/security-engineer:run` skill resolves the
+intent, echoes the command it derived, and runs it once. You rarely type its
+name — it fires on what you asked for:
 
 ```
 "remediate alert-192901290"                 → security-engineer --alert alert-192901290
@@ -120,15 +121,15 @@ measured and passed to the production-impact assessment.
 Inspect any decision without a token, an alert, or a pipeline run:
 
 ```bash
-python3 skills/security-engineer/run_agent.py resolve-version pypi pillow 8.3.1
+python3 skills/run/run_agent.py resolve-version pypi pillow 8.3.1
 ```
 
 Ecosystems: PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet. See
-`skills/security-engineer/SKILL.md` for the `version_data:` config keys.
+`skills/run/SKILL.md` for the `version_data:` config keys.
 
 ## Language coverage
 
-Each finding type runs through a pipeline (`skills/security-engineer/pipelines/`)
+Each finding type runs through a pipeline (`skills/run/pipelines/`)
 that owns its own post-fix check.
 
 **CVE:** the manifest must pin the resolved version, a lockfile beside it must
@@ -155,9 +156,10 @@ check and CI gates catch regressions.
 ```
 .claude-plugin/plugin.json   → plugin manifest
 bin/security-engineer        → CLI entry point (plugin bin/ is added to PATH)
-commands/run.md              → /security-engineer:run slash command
+commands/script.md           → /security-engineer:script slash command
 skills/
-  security-engineer/         → orchestrator, validator, agents, notifier
+  run/                       → /security-engineer:run skill — orchestrator, validator,
+                               agents, notifier. The directory name is the skill name.
     fix-agents/              → fix instructions per vulnerability type (cve, sast, iac, secret)
   lib/                       → shared Orca API client
 docs/                        → design plans
@@ -188,3 +190,21 @@ make loop ARGS="--dry-run cve"          # plan only, no writes
 per-alert state, PR URLs, Orca check conclusions, and the annotations behind any
 failure. See [`devloop/README.md`](devloop/README.md). Nothing in `devloop/` ships
 with the plugin.
+
+### Running your working tree as the plugin
+
+The dev loop runs `orchestrator.py` from this repo; `/security-engineer:run`
+runs the copy Claude Code made when the plugin was installed. Nothing refreshes
+that copy on its own — `claude plugin update` short-circuits while the version
+in `plugin.json` is unchanged — so the skill will keep running the commit it was
+installed at until you say otherwise.
+
+```bash
+make install         # install this working tree as the plugin
+make plugin-status   # is the installed plugin this code? names the files if not
+make uninstall       # remove it; marketplace goes back to GitHub
+```
+
+`make loop` and `make fast` run `make install` as a step, so the skill and the
+dev loop always test the same code. `make uninstall` then `./install.sh` gets
+you back to the published version — worth doing before tagging a release.

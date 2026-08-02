@@ -125,7 +125,7 @@ fi
 # --- 5. Truncate the in-repo run log -------------------------------------
 # Per-run logs live under devloop/runs/; this one only accumulates when the
 # orchestrator is invoked directly from the repo root.
-stray_log="$REPO_ROOT/skills/security-engineer/security-engineer-run.json"
+stray_log="$REPO_ROOT/skills/run/security-engineer-run.json"
 if [[ -s "$stray_log" ]]; then
   act "truncate $(basename "$stray_log")"
   [[ -z "$DRY" ]] && : > "$stray_log"
