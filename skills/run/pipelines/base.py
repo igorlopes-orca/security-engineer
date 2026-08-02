@@ -17,7 +17,6 @@ Specializing a type means adding a pipeline, not editing the orchestrator.
 """
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from validator import ValidationResult, local_build_check
 
@@ -34,7 +33,7 @@ class FixPlan:
     prompt_extra: str = ""
     metadata: dict = field(default_factory=dict)
     needs_review: bool = False
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def prepared(self) -> bool:
@@ -63,7 +62,7 @@ class FixPipeline:
         return FixPlan()
 
     def verify(self, task, worktree_path: Path,
-               plan: Optional[FixPlan] = None) -> ValidationResult:
+               plan: FixPlan | None = None) -> ValidationResult:
         """Language-appropriate build check — the pre-existing Phase 3."""
         alert = task.alert_json or {}
         files = task.fix_result.files_changed if task.fix_result else []

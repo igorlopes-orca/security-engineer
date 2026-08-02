@@ -123,9 +123,9 @@ def diff_line_count(diff_text: str) -> int:
     """Count added + removed lines in a unified diff, excluding file headers."""
     total = 0
     for line in diff_text.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
+        if line.startswith(("+++", "---")):
             continue
-        if line.startswith("+") or line.startswith("-"):
+        if line.startswith(("+", "-")):
             total += 1
     return total
 
@@ -168,8 +168,8 @@ def summary_version_mismatch(diff_summary: str, diff_text: str) -> str:
     if not diff_summary or not diff_text:
         return ""
 
-    added = "\n".join(l for l in diff_text.splitlines()
-                      if l.startswith("+") and not l.startswith("+++"))
+    added = "\n".join(line for line in diff_text.splitlines()
+                      if line.startswith("+") and not line.startswith("+++"))
     if not added:
         return ""
     present = set(_VERSION_TOKEN.findall(added))
@@ -234,8 +234,8 @@ def sanity_check(alert: dict, worktree_path: Path,
             failures.append(mismatch)
 
     if ft == "secret":
-        added = [l for l in diff_text.splitlines()
-                 if l.startswith("+") and not l.startswith("+++")]
+        added = [line for line in diff_text.splitlines()
+                 if line.startswith("+") and not line.startswith("+++")]
         for line in added:
             for pat in _SECRET_PATTERNS:
                 if re.search(pat, line):
@@ -475,7 +475,7 @@ def ci_gate(pr_url: str, timeout_sec: int = 600) -> ValidationResult:
             print("[INFO] no CI checks configured on this PR — nothing to gate on",
                   flush=True)
             return ValidationResult(passed=True, phase="ci", needs_review=True)
-        failed_lines = [l for l in result.stdout.splitlines() if "fail" in l.lower()]
+        failed_lines = [line for line in result.stdout.splitlines() if "fail" in line.lower()]
         # Fall back to stderr: gh reports several failure modes there with an
         # empty stdout, which produced a bare "CI checks failed: " with no cause.
         reason = ("; ".join(failed_lines[:3])

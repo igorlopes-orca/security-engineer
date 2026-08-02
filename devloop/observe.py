@@ -230,18 +230,18 @@ def verdict(alerts: list[dict], finished: bool = True) -> tuple[str, int]:
             where = "; ".join(
                 f"{a['alert_id']} ({a['phase'] or a['state'].lower()})" for a in pending
             )
-            return (f"VERDICT: run in progress — {done}/{len(alerts)} settled, "
-                    f"waiting on {where}", 1)
-        return (f"VERDICT: run in progress — all {len(alerts)} alerts settled, "
-                f"orchestrator still wrapping up", 1)
+            return ((f"VERDICT: run in progress — {done}/{len(alerts)} settled, "
+                     f"waiting on {where}"), 1)
+        return ((f"VERDICT: run in progress — all {len(alerts)} alerts settled, "
+                 f"orchestrator still wrapping up"), 1)
 
     if not alerts:
         # Two common causes, and the console tail printed above distinguishes
         # them: the run errored before fetching, or every alert was skipped
         # because its fix branch still existed on the remote.
-        return ("VERDICT: no alerts exercised — check the console lines above; "
-                "if the run reached the planning stage, the sandbox needs "
-                "`devloop/reset.sh`", 2)
+        return (("VERDICT: no alerts exercised — check the console lines above; "
+                 "if the run reached the planning stage, the sandbox needs "
+                 "`devloop/reset.sh`"), 2)
 
     counts: dict[str, int] = {}
     for a in alerts:
@@ -350,7 +350,7 @@ def build_report(run_dir: Path, online: bool = True) -> dict:
                     "url": pr.get("url"),
                     "title": pr.get("title"),
                     "branch": pr.get("headRefName"),
-                    "labels": [l.get("name") for l in pr.get("labels") or []],
+                    "labels": [lb.get("name") for lb in pr.get("labels") or []],
                 }
                 sha = pr.get("headRefOid")
                 if sha:

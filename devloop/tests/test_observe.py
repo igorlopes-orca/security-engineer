@@ -13,9 +13,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from observe import (parse_events, alert_events, derive_state, last_value,
-                     parse_pr_url, last_phase, classify_checks, _duration,
-                     verdict, planned_alerts, TERMINAL_STATES, NOT_STARTED)
+from observe import (
+    NOT_STARTED,
+    TERMINAL_STATES,
+    _duration,
+    alert_events,
+    classify_checks,
+    derive_state,
+    last_phase,
+    last_value,
+    parse_events,
+    parse_pr_url,
+    planned_alerts,
+    verdict,
+)
 
 
 class TestParseEvents(unittest.TestCase):
@@ -99,7 +110,7 @@ class TestDeriveState(unittest.TestCase):
                 self.assertEqual(derive_state(events), expected)
 
     def test_every_state_classified_terminal_or_not(self):
-        for desc, names, expected in self.CASES:
+        for desc, _names, expected in self.CASES:
             with self.subTest(desc):
                 self.assertIn(expected, TERMINAL_STATES | {"RUNNING", "UNKNOWN"})
 

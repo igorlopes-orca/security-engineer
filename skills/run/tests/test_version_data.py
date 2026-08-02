@@ -9,7 +9,6 @@ tests/fixtures/version_data/.
 Run with: python3 tests/test_version_data.py
 """
 import json
-import os
 import sys
 import tempfile
 import time
@@ -22,10 +21,20 @@ sys.path.insert(0, str(_DIR.parent))                 # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import version_data
-from version_data import (ECOSYSTEMS, AdvisoryScope, VersionDataFetcher,
-                          _events_to_intervals, _preferred_id, _safe_upgrades,
-                          advisory_scopes, bump_class, ecosystem_for_manifest,
-                          parse_version, resolve_bump, resolve_ecosystem)
+from version_data import (
+    ECOSYSTEMS,
+    AdvisoryScope,
+    VersionDataFetcher,
+    _events_to_intervals,
+    _preferred_id,
+    _safe_upgrades,
+    advisory_scopes,
+    bump_class,
+    ecosystem_for_manifest,
+    parse_version,
+    resolve_bump,
+    resolve_ecosystem,
+)
 
 _FIXTURES = _DIR / "fixtures" / "version_data"
 _PYPI = ECOSYSTEMS["pypi"]
@@ -919,6 +928,7 @@ class TestResolveVersionCommand(unittest.TestCase):
         import argparse
         import contextlib
         import io
+
         import run_agent
 
         args = argparse.Namespace(ecosystem=ecosystem, package=package,
@@ -996,6 +1006,7 @@ class TestResolveVersionCommand(unittest.TestCase):
     def test_registered_in_dispatch(self):
         """A subcommand missing from the dispatch table fails only at runtime."""
         import inspect
+
         import run_agent
         src = inspect.getsource(run_agent.main)
         self.assertIn('"resolve-version"', src)

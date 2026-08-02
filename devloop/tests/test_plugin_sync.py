@@ -14,9 +14,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from plugin_sync import (install_paths, read_registry, is_source, hash_tree,
-                         drift, summarize, scopes, IN_SYNC, DRIFTED,
-                         NOT_INSTALLED, PLUGIN_KEY)
+from plugin_sync import (
+    DRIFTED,
+    IN_SYNC,
+    NOT_INSTALLED,
+    PLUGIN_KEY,
+    drift,
+    hash_tree,
+    install_paths,
+    is_source,
+    read_registry,
+    scopes,
+    summarize,
+)
 
 CACHE = "/cache/orca-security/security-engineer/1.0.0"
 

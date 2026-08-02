@@ -19,8 +19,11 @@ sys.path.insert(0, str(_DIR.parent))
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))
 
 from orca_client import (
-    get_token, fetch_alert_by_id, fetch_alerts, list_repositories,
-    _extract_file_path, _normalize_code_snippet,
+    _extract_file_path,
+    fetch_alert_by_id,
+    fetch_alerts,
+    get_token,
+    list_repositories,
 )
 
 

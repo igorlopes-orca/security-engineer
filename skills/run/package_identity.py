@@ -19,14 +19,11 @@ import sys
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
-from version_data import Ecosystem, ecosystem_for_manifest, resolve_ecosystem
-
 from _json_util import find_last_json_with_key
-from validator import (_SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS,
-                       _subprocess_error_detail)
+from validator import _SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS, _subprocess_error_detail
+from version_data import Ecosystem, ecosystem_for_manifest
 
 try:                                    # stdlib from 3.11
     import tomllib
@@ -57,7 +54,7 @@ class PackageRef:
     cve_ids: list = field(default_factory=list)
     exact_pin: bool = True                   # False when the spec was a range
     resolved_by: str = ""                    # audit trail: how we got here
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -73,7 +70,7 @@ class PackageRef:
 # Name normalization
 # ---------------------------------------------------------------------------
 
-def normalize_name(name: str, ecosystem: Optional[Ecosystem] = None) -> str:
+def normalize_name(name: str, ecosystem: Ecosystem | None = None) -> str:
     """Fold a package name to a comparable form.
 
     PyPI treats runs of `-`, `_` and `.` as equivalent and is case-insensitive
@@ -214,7 +211,7 @@ def _read_toml_deps(text: str, tables: tuple) -> dict:
         return out
     try:
         data = tomllib.loads(text)
-    except Exception:                                       # noqa: BLE001
+    except Exception:
         return out
 
     def walk(node, path):
@@ -365,7 +362,7 @@ def read_manifest(path) -> dict:
 
 
 def find_dependency(deps: dict, name: str,
-                    ecosystem: Optional[Ecosystem] = None) -> Optional[Dependency]:
+                    ecosystem: Ecosystem | None = None) -> Dependency | None:
     """Look a package up in a parsed manifest, tolerant of name spelling."""
     want = normalize_name(name, ecosystem)
     for key, dep in deps.items():
@@ -492,7 +489,7 @@ def identify_package(alert: dict, worktree_path,
 
 
 def _match_from_alert(alert: dict, deps: dict,
-                      ecosystem: Ecosystem) -> Optional[Dependency]:
+                      ecosystem: Ecosystem) -> Dependency | None:
     """Find the manifest entry the alert names.
 
     The title is consulted before the description, and only within one source
@@ -547,7 +544,7 @@ Return ONLY this JSON as your final output (nothing after this block):
 
 
 def _match_from_llm(alert: dict, deps: dict, ecosystem: Ecosystem,
-                    manifest_rel: str, timeout_sec: int) -> Optional[Dependency]:
+                    manifest_rel: str, timeout_sec: int) -> Dependency | None:
     """Last resort when no manifest entry matches the alert's prose.
 
     Constrained to picking from the manifest, and the answer is looked up in the

@@ -5,16 +5,15 @@ Used by orca_alerts.py, orca_get_alert.py, and run_agent.py.
 Token: ORCA_API_TOKEN env var (base64 token string from Orca config)
        or ORCA_AUTH_TOKEN env var (same format)
 """
-import sys
-import os
 import json
+import os
 import re
 import subprocess
-import urllib.request
+import sys
 import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 
 @dataclass
@@ -26,7 +25,7 @@ class Repository:
     """
     name: str                           # "owner/repo" (derived from URL)
     url: str                            # "https://github.com/owner/repo" (for cloning)
-    clone_path: Optional[Path] = None   # set by _clone_repo() in multi-repo mode
+    clone_path: Path | None = None   # set by _clone_repo() in multi-repo mode
     orca_score: float = 0.0
     risk_level: str = ""
 
@@ -79,7 +78,7 @@ def _post(payload, token):
             return json.loads(r.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body}")
+        raise RuntimeError(f"HTTP {e.code}: {body}") from e
 
 
 def _extract_file_path(source: str) -> str:
@@ -349,7 +348,7 @@ def fetch_alerts(repo, token, min_level=None, feature_types=None, statuses=None)
 
     # Filter by feature_types
     if feature_types:
-        ft_set = set(ft.lower() for ft in feature_types)
+        ft_set = {ft.lower() for ft in feature_types}
         alerts = [a for a in alerts if _resolve_feature_type(a) in ft_set]
 
     return alerts
@@ -424,7 +423,7 @@ def _resolve_feature_type(alert):
     ft = (alert.get("feature_type") or "").lower()
     category = (alert.get("category") or "").lower()
     labels = alert.get("labels") or []
-    has_cve_label = any(re.match(r"CVE-\d{4}-\d+", str(l)) for l in labels)
+    has_cve_label = any(re.match(r"CVE-\d{4}-\d+", str(label)) for label in labels)
 
     # Package vulnerabilities: category "Vulnerabilities" with no feature_type
     if "vulnerabilit" in category and not ft:
