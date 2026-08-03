@@ -8,11 +8,14 @@ Not a lookup table. Claude reads the actual diff and alert context.
 import json
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from _json_util import find_last_json_with_key
-from validator import (_subprocess_error_detail, _SINGLE_SHOT_CONTRACT,
-                       _SINGLE_SHOT_MAX_TURNS, _SINGLE_SHOT_TOOL_FLAGS)
+from validator import (
+    _SINGLE_SHOT_CONTRACT,
+    _SINGLE_SHOT_MAX_TURNS,
+    _SINGLE_SHOT_TOOL_FLAGS,
+    _subprocess_error_detail,
+)
 
 
 @dataclass
@@ -105,9 +108,12 @@ def _render_fix_context(fix_context: dict | None) -> str:
                      f"advisory): {', '.join(unknown)}")
     others = [c.get("version") for c in (decision.get("candidates") or [])
               if c.get("version") != decision.get("target_version")]
-    lines.append(f"- Other safe versions available: "
-                 f"{', '.join(others) if others else 'none — this is the only '
-                                                     'published version that clears them'}")
+    # Hoisted out of the f-string rather than inlined: a line break inside a
+    # replacement field is Python 3.12+ syntax (PEP 701), and this module has to
+    # import on the 3.10 floor README.md advertises.
+    alternatives = ", ".join(others) if others else (
+        "none — this is the only published version that clears them")
+    lines.append(f"- Other safe versions available: {alternatives}")
     lines.append("")
     lines.append("Weigh the bump distance when judging risk: a major-version jump "
                  "can remove public APIs and raise language or runtime floors, "

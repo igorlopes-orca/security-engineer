@@ -35,7 +35,10 @@ and what fails closed: [`HARNESS.md`](HARNESS.md).**
 
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v1.0.33+
 - [GitHub CLI](https://cli.github.com/) (`gh`) — authenticated
-- Python 3.10+ (3.11+ for TOML manifests)
+- Python 3.10+ (3.11+ for TOML manifests). Stdlib only, with one optional
+  exception: [PyYAML](https://pyyaml.org/) is needed to read a
+  `SECURITY_ENGINEER_CONFIG` file. Without it the orchestrator warns once and
+  runs on built-in defaults.
 - An [Orca Security](https://orca.security/) API token
 
 ### Install the plugin
@@ -205,6 +208,9 @@ skills/
     orca_client.py             Orca API client
     version_data.py            OSV + deps.dev version-decision layer
 HARNESS.md                   how the harness works and why
+.github/workflows/ci.yml     tests and lint on every pull request
+tools/check_manifests.py     static checks on the plugin's own metadata
+ruff.toml                    the lint ruleset CI enforces
 devloop/                     live-run test harness — not shipped with the plugin
 docs/                        design plans
 ```
@@ -212,7 +218,8 @@ docs/                        design plans
 ## Developing
 
 ```bash
-make test                              # 366 unit tests, no token or network
+make test                              # 379 unit tests, no token or network
+make lint                              # ruff, shellcheck, plugin metadata
 make fast                              # test → install → reset sandbox → fix one alert → report
 make loop ARGS="--dry-run cve"         # plan only, no writes
 make loop ARGS="sast --max 2"          # any orchestrator filter
@@ -233,6 +240,26 @@ failure. See [`devloop/README.md`](devloop/README.md).
 
 New functions and behaviours need table-driven tests — a `CASES` list looped with
 `self.subTest`, per [`CLAUDE.md`](CLAUDE.md).
+
+### What CI checks
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every pull
+request: `make test` across Python 3.10–3.14, then `make lint`. It runs the same
+Make targets you do, so a green PR is predictable from your terminal rather than
+discovered on the pull request.
+
+```bash
+pip install ruff==0.16.1 shellcheck-py==0.11.0.1 pyyaml==6.0.3   # what CI pins
+```
+
+Lint rules live in [`ruff.toml`](ruff.toml), selected explicitly so a ruff
+release can't fail a PR that changed nothing. Formatting is not enforced.
+`tools/check_manifests.py` covers what the Python suites can't see: version drift
+between `plugin.json` and `marketplace.json`, a lost executable bit on
+`bin/security-engineer`, missing skill or command frontmatter.
+
+`make e2e` stays out of CI — it needs `ORCA_API_TOKEN`, and secrets aren't
+available to pull requests from forks.
 
 ### Running your working tree as the plugin
 

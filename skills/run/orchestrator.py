@@ -11,31 +11,34 @@ Usage: python3 orchestrator.py [filter_tokens] [--scan] [--dry-run] [--alert ID]
 import argparse
 import copy
 import json
-import os
 import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 _THIS_DIR = Path(__file__).parent
 _SKILLS_DIR = _THIS_DIR.parent
 sys.path.insert(0, str(_SKILLS_DIR / "lib"))
 sys.path.insert(0, str(_THIS_DIR))
 
-from orca_client import (RISK_ORDER, alert_branch_name, Repository,
-                         list_repositories, get_token, fetch_alerts,
-                         normalize_alert_id, _resolve_feature_type)
-
 from _json_util import find_last_json_with_key
 from config import load_config
-from notifier import build_notifiers, NotificationPayload
-from validator import (sanity_check, llm_validate, ci_gate, orca_check_gate,
-                       worktree_diff)
-from impact_agent import analyze_impact, ImpactResult
+from impact_agent import ImpactResult, analyze_impact
+from notifier import NotificationPayload, build_notifiers
+from orca_client import (
+    RISK_ORDER,
+    Repository,
+    _resolve_feature_type,
+    alert_branch_name,
+    fetch_alerts,
+    get_token,
+    list_repositories,
+    normalize_alert_id,
+)
 from pipelines import FixPlan, get_pipeline
+from validator import ci_gate, llm_validate, orca_check_gate, sanity_check, worktree_diff
 
 _RUN_AGENT = str(_THIS_DIR / "run_agent.py")
 
@@ -61,9 +64,9 @@ class FixAgentResult:
     files_changed: list[str] = field(default_factory=list)
     diff_summary: str = ""
     manual_steps: list[str] = field(default_factory=list)
-    failure_reason: Optional[str] = None
-    failed_step: Optional[str] = None
-    error_code: Optional[str] = None
+    failure_reason: str | None = None
+    failed_step: str | None = None
+    error_code: str | None = None
     timed_out: bool = False
 
 
@@ -76,23 +79,23 @@ class AlertTask:
     source: str
     alert_json: dict
     state: str = "PENDING"
-    pr_url: Optional[str] = None
-    failure_reason: Optional[str] = None
-    worktree_path: Optional[Path] = None
-    fix_result: Optional[FixAgentResult] = None
-    impact: Optional[ImpactResult] = None
+    pr_url: str | None = None
+    failure_reason: str | None = None
+    worktree_path: Path | None = None
+    fix_result: FixAgentResult | None = None
+    impact: ImpactResult | None = None
     needs_review: bool = False
     attempts: int = 0
     # What the type's specialist worked out before the agent ran. Carried on the
     # task because impact analysis, the PR body and the retry loop all need it.
-    fix_plan: Optional[FixPlan] = None
+    fix_plan: FixPlan | None = None
 
 
 # ---------------------------------------------------------------------------
 # Subprocess helper
 # ---------------------------------------------------------------------------
 
-def _run(cmd: list[str], check: bool = True, cwd: Optional[Path] = None) -> tuple[str, str, int]:
+def _run(cmd: list[str], check: bool = True, cwd: Path | None = None) -> tuple[str, str, int]:
     r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if check and r.returncode != 0:
         # Fall back to stdout before giving up on a message. run_agent.py reports
@@ -117,20 +120,20 @@ class WorktreeConflict(RuntimeError):
     """
 
 
-def _worktree_path(alert_id: str, repo: Optional[Repository] = None) -> Path:
+def _worktree_path(alert_id: str, repo: Repository | None = None) -> Path:
     """Namespace the worktree by repo so parallel --remote all runs cannot collide."""
     prefix = f"{repo.name.replace('/', '-')}-" if (repo and repo.name) else ""
     return Path(f"/tmp/orca-fix-{prefix}{alert_id}")
 
 
-def _local_branch_exists(branch: str, cwd: Optional[str]) -> bool:
+def _local_branch_exists(branch: str, cwd: str | None) -> bool:
     r = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
                         f"refs/heads/{branch}"],
                        capture_output=True, text=True, cwd=cwd)
     return r.returncode == 0
 
 
-def _branch_has_own_commits(branch: str, cwd: Optional[str]) -> bool:
+def _branch_has_own_commits(branch: str, cwd: str | None) -> bool:
     """True if `branch` carries commits that BASE_BRANCH does not.
 
     Separates a leaked empty branch (safe to reclaim) from one holding real work —
@@ -145,7 +148,7 @@ def _branch_has_own_commits(branch: str, cwd: Optional[str]) -> bool:
     return count != "0"
 
 
-def _create_worktree(alert_id: str, branch: str, repo: Optional[Repository] = None) -> Path:
+def _create_worktree(alert_id: str, branch: str, repo: Repository | None = None) -> Path:
     """Create an isolated git worktree with `branch` checked out from BASE_BRANCH.
 
     Clears leftovers from an earlier crashed run first — a stale directory used to
@@ -191,8 +194,8 @@ def _create_worktree(alert_id: str, branch: str, repo: Optional[Repository] = No
     return path
 
 
-def _remove_worktree(path: Optional[Path], branch: Optional[str] = None,
-                     repo: Optional[Repository] = None) -> None:
+def _remove_worktree(path: Path | None, branch: str | None = None,
+                     repo: Repository | None = None) -> None:
     """Remove worktree and clean up local branch.
 
     repo: when set (multi-repo mode) git commands run inside repo.clone_path.
@@ -458,8 +461,8 @@ def _what_changed(task: AlertTask) -> str:
         return summary
 
     lines = [
-        f"Bumped `{ref.get('package')}` from `{decision.get('current_version')}` "
-        f"to `{target}` in `{ref.get('manifest_path')}`.",
+        (f"Bumped `{ref.get('package')}` from `{decision.get('current_version')}` "
+         f"to `{target}` in `{ref.get('manifest_path')}`."),
         "",
         f"**Why this version:** {decision.get('rationale', '')}",
     ]
@@ -477,13 +480,14 @@ def _what_changed(task: AlertTask) -> str:
                   "range): " + ", ".join(f"`{u}`" for u in unknown)]
     sources = decision.get("data_sources") or []
     if sources:
-        lines += ["", f"<sub>Resolved from {', '.join(sources)}. Reproduce with "
-                  f"`run_agent.py resolve-version {ref.get('ecosystem')} "
-                  f"{ref.get('package')} {decision.get('current_version')}`.</sub>"]
+        lines += ["", (f"<sub>Resolved from {', '.join(sources)}. Reproduce with "
+                       f"`run_agent.py resolve-version {ref.get('ecosystem')} "
+                       f"{ref.get('package')} {decision.get('current_version')}`."
+                       "</sub>")]
     return "\n".join(lines)
 
 
-def _commit_and_pr(task: AlertTask, impact: Optional[ImpactResult], dry_run: bool) -> Optional[str]:
+def _commit_and_pr(task: AlertTask, impact: ImpactResult | None, dry_run: bool) -> str | None:
     """Stage, commit, and open PR. Returns PR URL or None (dry-run)."""
     if dry_run:
         print(f"  [dry-run] would commit and open PR for {task.alert_id}")
@@ -924,7 +928,7 @@ def _run_pipeline(task: AlertTask, dry_run: bool, notifier, repo: Repository) ->
 # Fetch and plan
 # ---------------------------------------------------------------------------
 
-def _detect_repo() -> Optional[Repository]:
+def _detect_repo() -> Repository | None:
     """Auto-detect the current repo from git remote and return a Repository object."""
     try:
         stdout, _, _ = _run(["git", "remote", "get-url", "origin"], check=False)
@@ -1048,7 +1052,7 @@ def _print_scan_report(repo_name, alerts):
 
 def _run_scan(args):
     """Execute scan mode: fetch alerts and print risk report, then exit."""
-    from run_agent import parse_filter, min_level_from_list
+    from run_agent import min_level_from_list, parse_filter
 
     levels, types = parse_filter(args.filter_tokens) if args.filter_tokens else (None, None)
     min_level = min_level_from_list(levels)
@@ -1131,7 +1135,7 @@ def exit_code_for(tasks: list[AlertTask]) -> int:
 def _print_summary(tasks: list[AlertTask], skipped: list[dict], scm_posture: list[dict],
                    repo: str, dry_run: bool):
     mode = "DRY-RUN" if dry_run else "Live"
-    print(f"\n## Security Engineer — Run Summary")
+    print("\n## Security Engineer — Run Summary")
     print(f"\n**Repo:** {repo}  |  **Mode:** {mode}\n")
 
     done = [t for t in tasks if t.state in ("DONE", "CI_FAILED")]

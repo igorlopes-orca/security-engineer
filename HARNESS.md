@@ -280,7 +280,7 @@ Notification backends are the same shape: implement `send()`, register in
 
 Two layers, because they catch different things.
 
-**Unit tests** — 366 across six suites, table-driven per `CLAUDE.md`, no token
+**Unit tests** — 379 across seven suites, table-driven per `CLAUDE.md`, no token
 and no network:
 
 ```bash
@@ -290,6 +290,18 @@ make test
 They cover argument parsing, flag validation, version ordering and advisory
 range logic, manifest parsing for every supported ecosystem, gate behaviour on
 mocked diffs, and the dry-run guarantees.
+
+**Static checks** — the linters, plus the plugin-metadata checks that no Python
+suite can see (version drift between `plugin.json` and `marketplace.json`, a
+lost executable bit, missing skill frontmatter):
+
+```bash
+make lint
+```
+
+Both run on every pull request via `.github/workflows/ci.yml`, `make test`
+across Python 3.10–3.14. CI calls the same Make targets, so it cannot drift from
+what you run locally.
 
 **The dev loop** — the parts that only exist in a live run: worktree lifecycle,
 whether the diff the gates judge is the diff that gets committed, whether gate 4

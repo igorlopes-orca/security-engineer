@@ -6,22 +6,25 @@ Claude handles the code fixes; this script handles everything else.
 
 Usage: python3 run_agent.py <subcommand> [options]
 """
-import sys
-import os
-import json
 import argparse
+import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 from orca_client import (
-    get_token, fetch_alerts, fetch_alert_by_id,
-    is_fixable, alert_branch_name, branch_exists_remote,
-    RISK_ORDER, _resolve_feature_type
+    RISK_ORDER,
+    _resolve_feature_type,
+    alert_branch_name,
+    branch_exists_remote,
+    fetch_alert_by_id,
+    fetch_alerts,
+    get_token,
+    is_fixable,
 )
-from version_data import (ecosystem_for_manifest, resolve_bump,
-                          resolve_ecosystem)
-
+from version_data import ecosystem_for_manifest, resolve_bump, resolve_ecosystem
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,7 +82,7 @@ def min_level_from_list(levels):
     """Return the lowest-ranked (most inclusive) level from a list."""
     if not levels:
         return None
-    indices = [RISK_ORDER.index(l) for l in levels if l in RISK_ORDER]
+    indices = [RISK_ORDER.index(level) for level in levels if level in RISK_ORDER]
     return RISK_ORDER[max(indices)] if indices else None
 
 
@@ -204,7 +207,7 @@ def cmd_git_setup(args):
     try:
         run(["git", "checkout", "main"])
         run(["git", "pull", "origin", "main"])
-        stdout, stderr, rc = run(["git", "checkout", "-b", branch], check=False)
+        _, stderr, rc = run(["git", "checkout", "-b", branch], check=False)
         if rc != 0:
             if "already exists" in stderr:
                 print("branch_exists_locally")
@@ -223,7 +226,7 @@ def cmd_git_commit(args):
 
     try:
         run(["git", "add", "-A"])
-        stdout, _, _ = run(["git", "commit", "-m", args.message])
+        run(["git", "commit", "-m", args.message])
         # Extract SHA from "1 file changed" line or git log
         sha, _, _ = run(["git", "rev-parse", "--short", "HEAD"])
         print(sha)

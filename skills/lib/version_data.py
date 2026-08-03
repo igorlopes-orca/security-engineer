@@ -17,6 +17,7 @@ the point of this module.
 Stdlib only, and never raises: every failure path returns a VersionDecision with
 `error` set, so a data-layer outage degrades the pipeline instead of stopping it.
 """
+import contextlib
 import json
 import os
 import re
@@ -27,7 +28,6 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 OSV_URL = "https://api.osv.dev/v1/query"
 DEPS_DEV_URL = "https://api.deps.dev/v3"
@@ -94,7 +94,7 @@ _ECOSYSTEM_ALIASES = {
 }
 
 
-def resolve_ecosystem(name: str) -> Optional[Ecosystem]:
+def resolve_ecosystem(name: str) -> Ecosystem | None:
     """Map any spelling of an ecosystem onto our canonical Ecosystem, or None."""
     if not name:
         return None
@@ -102,7 +102,7 @@ def resolve_ecosystem(name: str) -> Optional[Ecosystem]:
     return ECOSYSTEMS.get(key) if key else None
 
 
-def ecosystem_for_manifest(filename: str) -> Optional[Ecosystem]:
+def ecosystem_for_manifest(filename: str) -> Ecosystem | None:
     """Infer the ecosystem from a manifest or lockfile name (basename match)."""
     if not filename:
         return None
@@ -197,7 +197,7 @@ class Version:
         return self.raw
 
 
-def parse_version(raw) -> Optional[Version]:
+def parse_version(raw) -> Version | None:
     """Parse a version string, or None if it has no numeric release at all.
 
     Build metadata is discarded before parsing, which is what makes Go's
@@ -266,7 +266,7 @@ def _parse_suffix(rest: str) -> tuple:
     return _STAGE_PRE, 0, num, False
 
 
-def bump_class(current: Optional[Version], target: Optional[Version]) -> str:
+def bump_class(current: Version | None, target: Version | None) -> str:
     """Classify the distance of a bump: patch | minor | major | unknown."""
     if current is None or target is None:
         return "unknown"
@@ -330,7 +330,7 @@ def _preferred_id(ids) -> str:
         matches = sorted(i for i in ids if i.upper().startswith(prefix))
         if matches:
             return matches[0]
-    return sorted(ids)[0] if ids else ""
+    return min(ids) if ids else ""
 
 
 def advisory_scopes(vulns: list, package: str, ecosystem: Ecosystem) -> list:
@@ -565,10 +565,8 @@ class VersionDataFetcher:
                     json.dump(blob, f)
                 os.replace(tmp, path)
             except BaseException:
-                try:
+                with contextlib.suppress(OSError):
                     os.unlink(tmp)
-                except OSError:
-                    pass
                 raise
         except OSError as e:
             # A cache we cannot write is a slow cache, not a broken run.
@@ -594,9 +592,9 @@ class VersionDataFetcher:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:200]
-            raise RuntimeError(f"HTTP {e.code} from {url}: {body}")
+            raise RuntimeError(f"HTTP {e.code} from {url}: {body}") from e
         except urllib.error.URLError as e:
-            raise RuntimeError(f"cannot reach {url}: {e.reason}")
+            raise RuntimeError(f"cannot reach {url}: {e.reason}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -609,7 +607,7 @@ class VersionDecision:
     ecosystem: str
     package: str
     current_version: str
-    target_version: Optional[str] = None
+    target_version: str | None = None
     bump_class: str = "unknown"
     majors_crossed: int = 0
     advisories_cleared: list = field(default_factory=list)
@@ -618,7 +616,7 @@ class VersionDecision:
     candidates: list = field(default_factory=list)
     rationale: str = ""
     data_sources: list = field(default_factory=list)
-    error: Optional[str] = None
+    error: str | None = None
 
     @property
     def resolved(self) -> bool:
@@ -629,7 +627,7 @@ class VersionDecision:
 
 
 def resolve_bump(ecosystem, package: str, current_version: str,
-                 fetcher: Optional[VersionDataFetcher] = None,
+                 fetcher: VersionDataFetcher | None = None,
                  **fetcher_kwargs) -> VersionDecision:
     """Pick the lowest published version that clears every advisory on a package.
 
@@ -658,7 +656,7 @@ def resolve_bump(ecosystem, package: str, current_version: str,
     try:
         vulns = fetcher.osv_advisories(package, eco)
         published = fetcher.published_versions(package, eco)
-    except Exception as e:                          # noqa: BLE001 — never raise
+    except Exception as e:
         decision.data_sources = list(fetcher.sources)
         decision.error = f"{type(e).__name__}: {e}"
         return decision
@@ -770,8 +768,8 @@ def _best_effort_upgrade(published: list, current: Version, affecting: list):
 def _rationale(decision: VersionDecision, affecting: list) -> str:
     """One reviewable sentence: what we picked, why, and what it leaves behind."""
     cleared = decision.advisories_cleared
-    bits = [f"{decision.package} {decision.current_version} → "
-            f"{decision.target_version}"]
+    bits = [(f"{decision.package} {decision.current_version} → "
+             f"{decision.target_version}")]
     if decision.bump_class != "unknown":
         span = f"{decision.bump_class} bump"
         if decision.majors_crossed > 1:

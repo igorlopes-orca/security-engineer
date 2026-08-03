@@ -24,7 +24,7 @@ _SPECIALISTS = {
 }
 
 
-def get_pipeline(feature_type: str, timeouts: dict = None,
+def get_pipeline(feature_type: str, timeouts: dict | None = None,
                  **kwargs) -> FixPipeline:
     """The pipeline for a finding type. Never returns None.
 
@@ -54,4 +54,4 @@ def get_pipeline(feature_type: str, timeouts: dict = None,
                        diff_limit=diff_limit)
 
 
-__all__ = ["FixPipeline", "FixPlan", "CvePipeline", "get_pipeline"]
+__all__ = ["CvePipeline", "FixPipeline", "FixPlan", "get_pipeline"]

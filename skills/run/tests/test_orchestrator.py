@@ -8,6 +8,7 @@ Verifies that argument parsing, filter logic, and flag enforcement
 Run with: python3 tests/test_orchestrator.py
 No API token or network access required — all tests are pure Python.
 """
+import contextlib
 import inspect
 import shutil
 import subprocess
@@ -15,7 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import MagicMock, patch
 
 # Add parent dirs to path
 _DIR = Path(__file__).parent
@@ -23,17 +24,30 @@ sys.path.insert(0, str(_DIR.parent))             # security-engineer/
 sys.path.insert(0, str(_DIR.parent.parent / "lib"))  # lib/
 
 import orchestrator
-from orchestrator import (main, _invoke_fix_agent, _commit_and_pr, AlertTask,
-                          FixAgentResult, _validate_flags, _print_scan_report,
-                          run_one)
-from run_agent import parse_filter, min_level_from_list
-from orca_client import _resolve_feature_type, is_fixable, RISK_ORDER, Repository
-from config import load_config, Config, OrcaCheckConfig
-from impact_agent import analyze_impact, ImpactResult
-from validator import (llm_validate, orca_check_gate, _parse_pr_url,
-                       OrcaCheckFinding, ValidationResult, ci_gate,
-                       has_no_ci_checks, _subprocess_error_detail)
-
+from config import Config, OrcaCheckConfig, load_config
+from impact_agent import ImpactResult, analyze_impact
+from orca_client import RISK_ORDER, Repository, _resolve_feature_type, is_fixable
+from orchestrator import (
+    AlertTask,
+    FixAgentResult,
+    _commit_and_pr,
+    _invoke_fix_agent,
+    _print_scan_report,
+    _validate_flags,
+    main,
+    run_one,
+)
+from run_agent import min_level_from_list, parse_filter
+from validator import (
+    OrcaCheckFinding,
+    ValidationResult,
+    _parse_pr_url,
+    _subprocess_error_detail,
+    ci_gate,
+    has_no_ci_checks,
+    llm_validate,
+    orca_check_gate,
+)
 
 # ---------------------------------------------------------------------------
 # 1. Argument parsing
@@ -271,7 +285,8 @@ class TestScanReport(unittest.TestCase):
     ]
 
     def test_report_contains_all_alerts(self):
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
@@ -283,7 +298,8 @@ class TestScanReport(unittest.TestCase):
         self.assertIn("SQL Injection", output)
 
     def test_report_grouped_by_risk(self):
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
@@ -293,7 +309,8 @@ class TestScanReport(unittest.TestCase):
         self.assertIn("Medium", output)
 
     def test_report_total_count(self):
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             _print_scan_report("owner/repo", self.SAMPLE_ALERTS)
@@ -301,7 +318,8 @@ class TestScanReport(unittest.TestCase):
         self.assertIn("**3**", output)
 
     def test_empty_alerts(self):
-        import io, contextlib
+        import contextlib
+        import io
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             _print_scan_report("owner/repo", [])
@@ -463,7 +481,6 @@ class TestDryRunEnforcement(unittest.TestCase):
     def test_dry_run_uses_read_only_tools(self):
         """In dry-run mode, claude subprocess must receive --allowedTools Read (not Edit/Write/Bash)."""
         task = self._make_task()
-        captured_cmds = []
 
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(
@@ -708,7 +725,7 @@ class TestFetchAndPlanRepoDir(unittest.TestCase):
                                   clone_path=clone_path)
                 captured = {}
 
-                def fake_run(cmd, **kwargs):
+                def fake_run(cmd, captured=captured, **kwargs):
                     captured["cmd"] = list(cmd)
                     return ('{"alerts": []}', "", 0)
 
@@ -743,7 +760,7 @@ class TestWorktreeCwd(unittest.TestCase):
                                   clone_path=clone_path)
                 captured = {}
 
-                def fake_run(cmd, **kwargs):
+                def fake_run(cmd, captured=captured, **kwargs):
                     captured["cwd"] = kwargs.get("cwd")
                     return ("", "", 0)
 
@@ -763,7 +780,7 @@ class TestWorktreeCwd(unittest.TestCase):
                                   clone_path=clone_path)
                 cwd_values = []
 
-                def fake_subprocess(cmd, **kwargs):
+                def fake_subprocess(cmd, cwd_values=cwd_values, **kwargs):
                     cwd_values.append(kwargs.get("cwd"))
                     return MagicMock(returncode=0)
 
@@ -852,7 +869,7 @@ class TestRunRepoPipelineCleanup(unittest.TestCase):
                     r.clone_path = clone_path
                     return r
 
-                def fake_fetch(args, r):
+                def fake_fetch(args, r, fetch_error=fetch_error):
                     if fetch_error:
                         raise fetch_error
                     return [], [], [], []
@@ -862,13 +879,12 @@ class TestRunRepoPipelineCleanup(unittest.TestCase):
                      patch("orchestrator.build_notifiers", return_value=MagicMock()), \
                      patch("shutil.rmtree") as mock_rmtree, \
                      patch.object(Path, "exists", return_value=True):
-                    try:
+                    # The point of the test is the cleanup, not the failure: a
+                    # fetch error is expected to propagate here.
+                    with contextlib.suppress(Exception):
                         orchestrator._run_repo_pipeline(repo, self._args())
-                    except Exception:
-                        pass
 
-                mock_rmtree.assert_called_once_with(clone_path, ignore_errors=True), \
-                    f"{desc}: shutil.rmtree should have been called"
+                mock_rmtree.assert_called_once_with(clone_path, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -966,7 +982,8 @@ class TestOrcaCheckGate(unittest.TestCase):
 # Build root detection
 # ---------------------------------------------------------------------------
 
-import tempfile, os
+import os
+
 
 class TestFindPackageJsonRoot(unittest.TestCase):
     """_find_package_json_root walks up from changed files to locate package.json."""
@@ -1103,10 +1120,7 @@ class TestFindProjectRoot(unittest.TestCase):
 
             for desc, fn, files, marker, expected in CASES:
                 with self.subTest(desc):
-                    if marker:
-                        result = fn(files, tmp, marker)
-                    else:
-                        result = fn(files, tmp)
+                    result = fn(files, tmp, marker) if marker else fn(files, tmp)
                     self.assertEqual(result, expected, desc)
 
 
@@ -1306,7 +1320,7 @@ class TestLLMValidationErrors(unittest.TestCase):
         )
         for desc, side_effect, return_value, expected_substr in self.CASES:
             with self.subTest(desc):
-                claude_result = side_effect if side_effect else return_value
+                claude_result = side_effect or return_value
                 mock_run.side_effect = [git_add_result, git_diff_result, claude_result]
                 result = llm_validate({"alert_id": "test-1"}, Path("/tmp"))
                 self.assertTrue(result.passed, f"{desc}: should pass (flagged, not blocked)")
@@ -1488,7 +1502,6 @@ class TestConfig(unittest.TestCase):
 
     def test_load_config_no_env(self):
         """Without SECURITY_ENGINEER_CONFIG env var, defaults are used."""
-        import os
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SECURITY_ENGINEER_CONFIG", None)
             cfg = load_config()

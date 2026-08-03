@@ -15,19 +15,16 @@ touches requirements.txt (.txt), go.mod (.mod) or package.json (.json) — all o
 which fell through to `else: pass`. `go build ./...` had never once run on a CVE
 fix. So the gate that was supposed to catch a broken bump could not see one.
 """
-import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
-
-from validator import ValidationResult, _find_project_root, _run_check
 
 from package_identity import find_dependency, identify_package, read_manifest
+from validator import ValidationResult, _find_project_root, _run_check
+
 from pipelines.base import FixPipeline, FixPlan
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "lib"))
-from version_data import (advisory_scopes, parse_version, resolve_bump,
-                          VersionDataFetcher)
+from version_data import VersionDataFetcher, advisory_scopes, parse_version, resolve_bump
 
 # Where the per-ecosystem agent instructions live, appended to fix-agents/cve.md.
 _FRAGMENT_DIR = Path(__file__).parent.parent / "fix-agents" / "cve"
@@ -43,7 +40,7 @@ _RESOLVE_CHECKS = {
 }
 
 
-def build_fetcher(cfg=None) -> Optional[VersionDataFetcher]:
+def build_fetcher(cfg=None) -> VersionDataFetcher | None:
     """Fetcher configured from `version_data:`, or None when disabled.
 
     A None fetcher makes CvePipeline.prepare fall through to the agent's own
@@ -72,7 +69,7 @@ class CvePipeline(FixPipeline):
     feature_type = "cve"
 
     def __init__(self, timeout_sec: int = 240, diff_limit: int = 200,
-                 fetcher: Optional[VersionDataFetcher] = None,
+                 fetcher: VersionDataFetcher | None = None,
                  allow_llm_identify: bool = True):
         super().__init__("cve", timeout_sec, diff_limit)
         self.fetcher = fetcher
@@ -122,8 +119,8 @@ class CvePipeline(FixPipeline):
         lines = [
             "## Target Version (already decided — do not choose another)",
             "",
-            f"Set **{ref.package}** to exactly **{decision.target_version}** "
-            f"in `{ref.manifest_path}`.",
+            (f"Set **{ref.package}** to exactly **{decision.target_version}** "
+             f"in `{ref.manifest_path}`."),
             "",
             f"- Ecosystem: {ref.ecosystem.key}",
             f"- Currently declared: {ref.current_version}"
@@ -142,12 +139,12 @@ class CvePipeline(FixPipeline):
                          f"be applied: {others}")
         lines += [
             "",
-            "This version was resolved from OSV advisory ranges and the "
-            "published version list. It is the lowest release that clears the "
-            "advisories affecting the installed version. Do **not** substitute a "
-            "different version, and do not 'upgrade to latest' — if "
-            f"{decision.target_version} cannot be applied, report failure with "
-            "the reason instead.",
+            ("This version was resolved from OSV advisory ranges and the "
+             "published version list. It is the lowest release that clears the "
+             "advisories affecting the installed version. Do **not** substitute a "
+             "different version, and do not 'upgrade to latest' — if "
+             f"{decision.target_version} cannot be applied, report failure with "
+             "the reason instead."),
         ]
         fragment = self._ecosystem_fragment(ref.ecosystem.key)
         if fragment:
@@ -165,7 +162,7 @@ class CvePipeline(FixPipeline):
     # -- after the agent runs ----------------------------------------------
 
     def verify(self, task, worktree_path: Path,
-               plan: Optional[FixPlan] = None) -> ValidationResult:
+               plan: FixPlan | None = None) -> ValidationResult:
         """Did the manifest actually end up pinning a safe version?
 
         Without a plan we cannot say what "correct" was, so fall back to the
@@ -290,7 +287,7 @@ class CvePipeline(FixPipeline):
         try:
             fetcher = self.fetcher or VersionDataFetcher()
             vulns = fetcher.osv_advisories(ref.get("package", ""), eco)
-        except Exception:                                        # noqa: BLE001
+        except Exception:
             return False
         scopes = [s for s in advisory_scopes(vulns, ref.get("package", ""), eco)
                   if s.scoped]
