@@ -1,7 +1,7 @@
 ---
 name: run
 description: Remediate Orca Security alerts end to end — fix, validate, assess production impact, open a PR, notify. Use whenever someone asks to fix, remediate, patch, triage, or scan security alerts, vulnerabilities, or findings, whether they name a severity ("remediate all high vulnerabilities", "patch the critical ones"), a type ("fix the SAST issues", "clean up the hardcoded secrets", "bump the vulnerable dependencies", "fix the Dockerfile findings"), a CVE or advisory id ("fix CVE-2020-7471", "are we exposed to log4shell", "patch GHSA-2p49-hgcm-8545", "where is CVE-2021-44228 open"), a count ("just one", "max of 3"), an alert ID ("remediate alert-192901290", "fix orca-4060720"), or a repo ("fix everything in owner/repo", "scan all our repos"). Also covers dry runs and read-only risk reports. Covers CVE/SCA, SAST, IaC, and secret findings.
-argument-hint: "[risk_levels,feature_types] [--scan] [--cve <id>] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
+argument-hint: "fix CVE-2020-7471 | remediate up to 3 high CVEs | what risks does this repo have? | patch the secrets in acme/api"
 allowed-tools: Bash
 ---
 
