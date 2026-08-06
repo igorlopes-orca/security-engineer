@@ -36,6 +36,7 @@ from orca_client import (
     get_token,
     list_repositories,
     normalize_alert_id,
+    repos_with_cve,
 )
 from pipelines import FixPlan, get_pipeline
 from validator import ci_gate, llm_validate, orca_check_gate, sanity_check, worktree_diff
@@ -89,6 +90,10 @@ class AlertTask:
     # What the type's specialist worked out before the agent ran. Carried on the
     # task because impact analysis, the PR body and the retry loop all need it.
     fix_plan: FixPlan | None = None
+    # The advisory ids this alert was selected for, when the run named any. A
+    # package alert covers every CVE in its package, so without this the run has
+    # no way to say which one was asked for — or to check that it was cleared.
+    requested_cves: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +472,17 @@ def _what_changed(task: AlertTask) -> str:
         f"**Why this version:** {decision.get('rationale', '')}",
     ]
     cleared = decision.get("advisories_cleared") or []
+    requested = (plan.metadata.get("requested_cves") if plan and plan.metadata
+                 else None) or []
+    if requested:
+        # The alert covers a whole package, so a reviewer who opened this PR
+        # looking for one CVE needs to see both that it was the trigger and that
+        # the bump went wider than it.
+        also = len(cleared) - len(requested)
+        extra = (f", and {also} other advisor{'y' if also == 1 else 'ies'} "
+                 "on the same package" if also > 0 else "")
+        named = ", ".join(f"`{c}`" for c in requested)
+        lines += ["", f"**Requested:** {named} — cleared by this bump{extra}."]
     if cleared:
         lines += ["", "**Advisories cleared:** "
                   + ", ".join(f"`{c}`" for c in cleared)]
@@ -948,12 +964,15 @@ def _fetch_and_plan(args, repo: Repository) -> tuple[list[AlertTask], list[dict]
     repo.clone_path: when set, passes --repo-dir to run_agent.py so git ops
                      (detect_repo, branch_exists_remote) run inside the clone.
     """
+    cve_ids = getattr(args, "cve_ids", None) or []
     cmd = ["python3", _RUN_AGENT, "list-alerts", repo.name]
     if args.alert:
         cmd += ["--alert", args.alert]
     else:
         if args.filter_tokens:
             cmd += ["--filter", args.filter_tokens]
+        for cve in cve_ids:
+            cmd += ["--cve", cve]
         if args.max:
             cmd += ["--max", str(args.max)]
     cmd.append("--fixable-only")
@@ -987,9 +1006,38 @@ def _fetch_and_plan(args, repo: Repository) -> tuple[list[AlertTask], list[dict]
                 feature_type=ft,
                 source=a.get("source", ""),
                 alert_json=full,
+                requested_cves=list(cve_ids),
             ))
 
     return to_fix, skipped, scm_posture, unfixable
+
+
+def _print_cve_elsewhere(cve_ids, current_repo):
+    """On a CVE run that matched nothing, say where the CVE actually is.
+
+    A bare "no alerts found" is a dead end when the user named a specific
+    advisory: the useful next fact is whether it is open somewhere else. One
+    extra query, only on the empty path, and a failure to answer is not worth
+    turning into an error — the run already succeeded at finding nothing.
+    """
+    joined = ", ".join(cve_ids)
+    try:
+        elsewhere = [(name, n) for name, n in repos_with_cve(cve_ids, get_token())
+                     if name != current_repo]
+    except (RuntimeError, SystemExit):
+        return
+    if not elsewhere:
+        print(f"\n{joined} is not open in any code repository Orca is scanning.")
+        return
+    total = sum(n for _, n in elsewhere)
+    print(f"\n{joined} is open in {len(elsewhere)} other "
+          f"{'repository' if len(elsewhere) == 1 else 'repositories'} "
+          f"({total} alert{'s' if total != 1 else ''}):")
+    for name, n in elsewhere:
+        print(f"  {name}  ({n} alert{'s' if n != 1 else ''})")
+    single = elsewhere[0][0] if len(elsewhere) == 1 else "all"
+    print(f"\nTo fix it there:  security-engineer --cve {cve_ids[0]} "
+          f"--remote {single}")
 
 
 # ---------------------------------------------------------------------------
@@ -998,8 +1046,14 @@ def _fetch_and_plan(args, repo: Repository) -> tuple[list[AlertTask], list[dict]
 
 def _validate_flags(args):
     """Reject invalid flag combinations. Called immediately after argparse."""
+    if getattr(args, "cve_ids", None) and args.alert:
+        sys.exit("Error: --cve and --alert cannot be combined. Both choose "
+                 "which alerts to fix; pass one.")
     if not args.scan:
         return
+    # --cve is deliberately absent from the rejections below: it narrows the
+    # list, which is what scan mode is for. --dry-run, --alert and --max are
+    # rejected because they are about *fixing*, which scan does not do.
     if args.dry_run:
         sys.exit("Error: --scan and --dry-run cannot be combined. "
                  "--scan already lists alerts without fixing.")
@@ -1020,7 +1074,7 @@ _RISK_BADGE = {"critical": "\U0001f534", "high": "\U0001f7e0",
                "informational": "\u26aa"}
 
 
-def _print_scan_report(repo_name, alerts):
+def _print_scan_report(repo_name, alerts, cve_ids=None):
     """Print a risk report grouped by severity — no fixes, no git ops."""
     grouped = {lvl: [] for lvl in RISK_ORDER}
     for a in alerts:
@@ -1029,6 +1083,8 @@ def _print_scan_report(repo_name, alerts):
 
     total = sum(len(v) for v in grouped.values())
     print(f"# Orca Alerts — {repo_name}")
+    if cve_ids:
+        print(f"\nFiltered to alerts carrying: **{', '.join(cve_ids)}**")
     print(f"\nTotal open/in-progress: **{total}**\n")
 
     print("| Risk Level | Count |")
@@ -1043,19 +1099,30 @@ def _print_scan_report(repo_name, alerts):
         if not items:
             continue
         print(f"\n## {_RISK_BADGE.get(lvl, '')} {lvl.capitalize()} ({len(items)})\n")
-        print("| Alert ID | Title | Category | Score | Type |")
-        print("|---|---|---|---|---|")
+        # The advisory count only earns a column when the report was narrowed to
+        # a CVE: that is when "this alert covers 41 of them" is the surprise.
+        head = "| Alert ID | Title | Category | Score | Type |"
+        rule = "|---|---|---|---|---|"
+        print(head + (" Advisories |" if cve_ids else ""))
+        print(rule + ("---|" if cve_ids else ""))
         for a in items:
             ftype = _resolve_feature_type(a)
-            print(f"| {a['alert_id']} | {a['title']} | {a['category']} | {a['score']} | {ftype} |")
+            row = (f"| {a['alert_id']} | {a['title']} | {a['category']} | "
+                   f"{a['score']} | {ftype} |")
+            if cve_ids:
+                row += f" {len(a.get('cve_ids') or [])} |"
+            print(row)
 
 
 def _run_scan(args):
     """Execute scan mode: fetch alerts and print risk report, then exit."""
     from run_agent import min_level_from_list, parse_filter
 
-    levels, types = parse_filter(args.filter_tokens) if args.filter_tokens else (None, None)
+    levels, types, filter_cves = (parse_filter(args.filter_tokens)
+                                  if args.filter_tokens else (None, None, None))
     min_level = min_level_from_list(levels)
+    cve_ids = list(dict.fromkeys((getattr(args, "cve_ids", None) or [])
+                                 + list(filter_cves or []))) or None
     token = get_token()
 
     if args.remote is not None:
@@ -1063,27 +1130,35 @@ def _run_scan(args):
             repos = list_repositories(token)
             if not repos:
                 sys.exit("No repositories found in Orca.")
+            found = False
             for repo in repos:
                 try:
-                    alerts = fetch_alerts(repo.name, token,
-                                          min_level=min_level, feature_types=types)
+                    alerts = fetch_alerts(repo.name, token, min_level=min_level,
+                                          feature_types=types, cve_ids=cve_ids)
                 except RuntimeError as e:
                     print(f"\nError fetching alerts for {repo.name}: {e}",
                           file=sys.stderr)
                     continue
                 if alerts:
-                    _print_scan_report(repo.name, alerts)
+                    found = True
+                    _print_scan_report(repo.name, alerts, cve_ids)
                     print()
+            if not found and cve_ids:
+                print(f"No open alert in any repository carries "
+                      f"{', '.join(cve_ids)}.")
         elif "/" in args.remote:
             try:
-                alerts = fetch_alerts(args.remote, token,
-                                      min_level=min_level, feature_types=types)
+                alerts = fetch_alerts(args.remote, token, min_level=min_level,
+                                      feature_types=types, cve_ids=cve_ids)
             except RuntimeError as e:
                 sys.exit(f"Error fetching alerts for {args.remote}: {e}")
             if not alerts:
-                print(f"No alerts found for {args.remote}.")
+                print(f"No alerts found for {args.remote}"
+                      + (f" carrying {', '.join(cve_ids)}." if cve_ids else "."))
+                if cve_ids:
+                    _print_cve_elsewhere(cve_ids, args.remote)
                 return
-            _print_scan_report(args.remote, alerts)
+            _print_scan_report(args.remote, alerts, cve_ids)
         else:
             sys.exit("Error: --remote requires 'all' or 'owner/repo'")
     else:
@@ -1092,24 +1167,30 @@ def _run_scan(args):
             sys.exit("Error: could not detect repo from git remote. "
                      "Run from inside a git repo or use --scan --remote owner/repo.")
         try:
-            alerts = fetch_alerts(repo.name, token,
-                                  min_level=min_level, feature_types=types)
+            alerts = fetch_alerts(repo.name, token, min_level=min_level,
+                                  feature_types=types, cve_ids=cve_ids)
         except RuntimeError as e:
             sys.exit(f"Error fetching alerts: {e}")
         if not alerts:
-            print(f"No alerts found for {repo.name}.")
+            print(f"No alerts found for {repo.name}"
+                  + (f" carrying {', '.join(cve_ids)}." if cve_ids else "."))
+            if cve_ids:
+                _print_cve_elsewhere(cve_ids, repo.name)
             return
-        _print_scan_report(repo.name, alerts)
+        _print_scan_report(repo.name, alerts, cve_ids)
 
 
 # ---------------------------------------------------------------------------
 # Output
 # ---------------------------------------------------------------------------
 
-def _print_plan(to_fix, skipped, scm_posture, unfixable, repo, dry_run):
+def _print_plan(to_fix, skipped, scm_posture, unfixable, repo, dry_run,
+                cve_ids=None):
     mode = "DRY-RUN" if dry_run else "LIVE"
     total = len(to_fix) + len(skipped) + len(scm_posture) + len(unfixable)
     print(f"\nRepository: {repo}  |  Mode: {mode}")
+    if cve_ids:
+        print(f"CVE filter: {', '.join(cve_ids)}")
     print(f"\nFound {total} alerts:")
     print(f"  ✓  {len(to_fix)} to fix")
     print(f"  ⟳  {len(skipped)} skipped (branch exists)")
@@ -1119,6 +1200,13 @@ def _print_plan(to_fix, skipped, scm_posture, unfixable, repo, dry_run):
         print("\nPlanned fixes:")
         for i, t in enumerate(to_fix, 1):
             print(f"  {i}. {t.alert_id} — {t.title} ({t.risk_level}, {t.feature_type}) — {t.source}")
+            # A package alert covers every advisory in its package, and the
+            # minimum-safe bump clears all of them. Say so before the run, not
+            # in the PR body afterwards.
+            covered = len(t.alert_json.get("cve_ids") or []) if t.alert_json else 0
+            if cve_ids and covered > 1:
+                print(f"       covers {covered} advisories in total — the bump "
+                      f"clears all of them, not just {cve_ids[0]}")
 
 
 def exit_code_for(tasks: list[AlertTask]) -> int:
@@ -1230,7 +1318,8 @@ def _run_repo_pipeline(repo: Repository, args) -> dict:
         p.detail = f"{len(to_fix)} to fix, {len(skipped)} skipped, {len(unfixable)} unfixable"
         notifier.notify("alerts_fetched", p)
 
-        _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run)
+        _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name,
+                    args.dry_run, getattr(args, "cve_ids", None))
 
         results: list[AlertTask] = []
         if to_fix:
@@ -1340,10 +1429,14 @@ def main(argv=None):
                         help="Clone and fix: 'all' for all Orca repos, 'owner/repo' for one")
     parser.add_argument("--alert", default=None,
                         help="Target a single alert ID")
+    parser.add_argument("--cve", action="append", default=None, dest="cve",
+                        help="Only alerts carrying this advisory id, e.g. "
+                             "CVE-2020-7471 (repeatable, or comma-separated)")
     parser.add_argument("--max", type=int, default=None,
                         help="Cap number of fixes")
     parser.add_argument("positional", nargs="*",
-                        help="[filter_tokens] e.g. 'high,sast' or 'cve'")
+                        help="[filter_tokens] e.g. 'high,sast', 'cve', or an "
+                             "advisory id such as 'CVE-2020-7471'")
     args = parser.parse_args(argv)
 
     # Canonicalize here, at the CLI boundary, and not only inside
@@ -1352,11 +1445,24 @@ def main(argv=None):
     # be reported back under a name Orca never uses.
     args.alert = normalize_alert_id(args.alert)
 
+    # Same boundary, same reason: the advisory id reaches the plan header, the
+    # fix directive and the PR body, not only the query.
+    from run_agent import parse_cve_args, parse_filter
+    args.cve_ids = parse_cve_args(args.cve)
+
     # All positional tokens are filter tokens — repo is always auto-detected from git remote
     args.repo = None
     args.filter_tokens = None
     for p in args.positional:
         args.filter_tokens = p
+
+    # A bare `security-engineer CVE-2020-7471` arrives as a positional. It is a
+    # selector, not a severity, and dropping it would silently widen the run to
+    # every open alert — so it is promoted here rather than warned about later.
+    if args.filter_tokens:
+        _, _, positional_cves = parse_filter(args.filter_tokens)
+        if positional_cves:
+            args.cve_ids = list(dict.fromkeys(args.cve_ids + positional_cves))
 
     _validate_flags(args)
 
@@ -1406,9 +1512,12 @@ def main(argv=None):
     except RuntimeError as e:
         sys.exit(f"Error: could not fetch alerts for {repo.name}: {e}")
 
-    _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run)
+    _print_plan(to_fix, skipped, scm_posture, unfixable, repo.name, args.dry_run,
+                args.cve_ids)
 
     if not to_fix:
+        if args.cve_ids and not (skipped or scm_posture or unfixable):
+            _print_cve_elsewhere(args.cve_ids, repo.name)
         notifier.notify("run_complete", NotificationPayload(
             event="run_complete", alert_id="-", feature_type="-", risk_level="-",
             repo=repo.name, succeeded=0, failed=0, skipped=len(skipped),

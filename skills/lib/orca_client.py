@@ -151,6 +151,11 @@ def _normalize_alert(item):
         "source":         source,
         "file_path":      _extract_file_path(source),
         "labels":         val(item, "Labels", []) or [],
+        # Every advisory this alert covers. A package alert is one *package*,
+        # not one CVE — Orca's django alert carries 41 ids — so this is also the
+        # only complete list available: RiskFindings.cves.top_cves holds just
+        # the highest-scoring one.
+        "cve_ids":        val(item, "CveIds", []) or [],
         "description":    val(item, "Description", ""),
         "recommendation": val(item, "Recommendation", ""),
         "feature_type":   findings.get("feature_type", ""),
@@ -244,6 +249,85 @@ def normalize_alert_id(alert_id):
     return f"orca-{candidate}" if candidate.isdigit() else str(alert_id).strip()
 
 
+# Advisory id schemes that appear in Orca's CveIds field. Only the scheme prefix
+# is case-normalized: a CVE id's body is digits, but a GHSA id's is lowercase by
+# construction (GHSA-2p49-hgcm-8545), so uppercasing the whole string would
+# invent an id nobody issued.
+_ADVISORY_SCHEMES = ("CVE", "GHSA", "PYSEC", "GO", "RUSTSEC", "OSV")
+
+
+def normalize_cve_id(cve_id):
+    """Coerce however a human wrote an advisory id into its canonical form.
+
+    Canonical here means what the id's issuer prints: `cve-2020-7471` becomes
+    `CVE-2020-7471`, `ghsa-2p49-hgcm-8545` becomes `GHSA-2p49-hgcm-8545`. The
+    Orca API matches case-insensitively either way, but the value also reaches
+    the plan table, the fix directive and the PR body, so it is normalized at
+    the boundary for the same reason `normalize_alert_id` is.
+
+    An id in no scheme we recognize is returned trimmed but otherwise untouched,
+    so it still reaches the API under the name the user typed.
+
+    Idempotent — a canonical id survives a second pass.
+    """
+    if not cve_id:
+        return cve_id
+    candidate = str(cve_id).strip()
+    scheme, sep, rest = candidate.partition("-")
+    if sep and scheme.upper() in _ADVISORY_SCHEMES:
+        return f"{scheme.upper()}-{rest}"
+    return candidate
+
+
+def _cve_filter_clause(cve_ids):
+    """The serving-layer clause matching alerts carrying any of these ids.
+
+    CveIds is a list field, so it needs `any_match` wrapping an inner `in`
+    rather than the flat `str`/`in` shape the scalar keys use — a flat clause is
+    rejected with "Unknown field 'CveIds'". This is the same clause Orca's own
+    Discovery UI builds for "code repository alerts for CVE-...".
+    """
+    values = [normalize_cve_id(c) for c in cve_ids]
+    return {
+        "type": "list",
+        "key": "CveIds",
+        "operator": "any_match",
+        "values": [{"type": "str", "key": "CveIds",
+                    "operator": "in", "values": values}],
+    }
+
+
+# Restricts a query to alerts on code repositories. Needed whenever alerts are
+# selected by something other than a repo name: a bare CveIds query also returns
+# cloud-workload alerts (a "Vulnerable Software" finding on a VM running the same
+# vulnerable package), which this pipeline has no way to fix.
+CODE_REPOSITORY_INVENTORY = {
+    "keys": ["Inventories"],
+    "models": ["Inventory"],
+    "type": "object_set",
+    "operator": "has",
+    "with": {
+        "type": "operation",
+        "operator": "and",
+        "values": [
+            {"type": "str", "key": "NewCategory",
+             "operator": "eq", "values": ["CI Source"]},
+            {"type": "str", "key": "NewSubCategory",
+             "operator": "eq", "values": ["Code Repository"]},
+        ],
+    },
+}
+
+# Every Alert field the two rich fetches request. One list, because a field
+# added for one caller and forgotten in the other is how `cve_ids` would end up
+# populated in bulk mode and empty for --alert.
+_ALERT_SELECT = [
+    "AlertId", "AlertType", "OrcaScore", "RiskLevel", "Category",
+    "Source", "Status", "Description", "Recommendation",
+    "RiskFindings", "Labels", "AssetData", "CveIds",
+]
+
+
 def fetch_alert_by_id(alert_id, token):
     """Fetch a single alert by ID. Returns normalized dict or None."""
     alert_id = normalize_alert_id(alert_id)
@@ -259,11 +343,7 @@ def fetch_alert_by_id(alert_id, token):
             }
         },
         "limit": 1,
-        "select": [
-            "AlertId", "AlertType", "OrcaScore", "RiskLevel", "Category",
-            "Source", "Status", "Description", "Recommendation",
-            "RiskFindings", "Labels", "AssetData"
-        ],
+        "select": _ALERT_SELECT,
         "get_results_and_count": False,
         "full_graph_fetch": {"enabled": True},
         "debug_enable_bu_tags": True,
@@ -276,7 +356,70 @@ def fetch_alert_by_id(alert_id, token):
     return _normalize_alert(items[0])
 
 
-def fetch_alerts(repo, token, min_level=None, feature_types=None, statuses=None):
+def alerts_payload(repo, statuses=None, cve_ids=None, limit=100):
+    """The serving-layer request `fetch_alerts` sends.
+
+    Split out from the fetch so the query can be asserted in a unit test without
+    a token or a network call — the CVE clause in particular is a shape the API
+    rejects outright when it is wrong, which is a poor thing to discover live.
+    """
+    clauses = [
+        {
+            "key": "Category",
+            "values": ALL_CATEGORIES,
+            "type": "str",
+            "operator": "in"
+        },
+        {
+            "key": "Status",
+            "values": statuses or ["open", "in_progress"],
+            "type": "str",
+            "operator": "in"
+        },
+    ]
+    if repo:
+        clauses.append({
+            "keys": ["Inventories"],
+            "models": ["Inventory"],
+            "type": "object_set",
+            "operator": "has",
+            "with": {
+                "key": "Name",
+                "values": [repo],
+                "type": "str",
+                "operator": "in"
+            }
+        })
+    else:
+        # No repo to scope by, so scope by asset kind instead — see
+        # CODE_REPOSITORY_INVENTORY.
+        clauses.append(CODE_REPOSITORY_INVENTORY)
+    if cve_ids:
+        clauses.append(_cve_filter_clause(cve_ids))
+
+    return {
+        "query": {
+            "models": ["Alert"],
+            "type": "object_set",
+            "with": {
+                "operator": "and",
+                "type": "operation",
+                "values": clauses
+            }
+        },
+        "limit": limit,
+        "start_at_index": 0,
+        "order_by[]": ["-OrcaScore"],
+        "select": _ALERT_SELECT,
+        "get_results_and_count": False,
+        "full_graph_fetch": {"enabled": True},
+        "debug_enable_bu_tags": True,
+        "max_tier": 2
+    }
+
+
+def fetch_alerts(repo, token, min_level=None, feature_types=None, statuses=None,
+                 cve_ids=None):
     """
     Fetch open alerts for a repo.
 
@@ -284,58 +427,10 @@ def fetch_alerts(repo, token, min_level=None, feature_types=None, statuses=None)
     min_level     - minimum risk level (inclusive); None means all
     feature_types - list of feature_type strings to include; None means all
     statuses      - list of statuses; defaults to ["open", "in_progress"]
+    cve_ids       - advisory ids; an alert matches if it carries any of them.
+                    Filtered server-side, so --max still caps real matches.
     """
-    if statuses is None:
-        statuses = ["open", "in_progress"]
-
-    payload = {
-        "query": {
-            "models": ["Alert"],
-            "type": "object_set",
-            "with": {
-                "operator": "and",
-                "type": "operation",
-                "values": [
-                    {
-                        "key": "Category",
-                        "values": ALL_CATEGORIES,
-                        "type": "str",
-                        "operator": "in"
-                    },
-                    {
-                        "key": "Status",
-                        "values": statuses,
-                        "type": "str",
-                        "operator": "in"
-                    },
-                    {
-                        "keys": ["Inventories"],
-                        "models": ["Inventory"],
-                        "type": "object_set",
-                        "operator": "has",
-                        "with": {
-                            "key": "Name",
-                            "values": [repo],
-                            "type": "str",
-                            "operator": "in"
-                        }
-                    }
-                ]
-            }
-        },
-        "limit": 100,
-        "start_at_index": 0,
-        "order_by[]": ["-OrcaScore"],
-        "select": [
-            "AlertId", "AlertType", "OrcaScore", "RiskLevel",
-            "Category", "Source", "Status", "Description",
-            "Recommendation", "RiskFindings", "Labels"
-        ],
-        "get_results_and_count": False,
-        "full_graph_fetch": {"enabled": True},
-        "debug_enable_bu_tags": True,
-        "max_tier": 2
-    }
+    payload = alerts_payload(repo, statuses=statuses, cve_ids=cve_ids)
 
     result = _post(payload, token)
     items = result.get("data", [])
@@ -413,6 +508,27 @@ def list_repositories(token: str) -> list:
             risk_level=(val(item, "RiskLevel", "") or "").lower(),
         ))
     return repos
+
+
+def repos_with_cve(cve_ids, token, statuses=None):
+    """Which code repositories have an open alert carrying these advisory ids.
+
+    One query, no cloning, no per-repo iteration — the CveIds filter is
+    server-side and the repo name comes back on each alert. Answers "where is
+    this CVE open?", which is the first question anyone asks and should not
+    require a fix run.
+
+    Returns [(repo_name, alert_count)] ordered by count descending.
+    """
+    payload = alerts_payload(None, statuses=statuses, cve_ids=cve_ids)
+    result = _post(payload, token)
+    counts: dict = {}
+    for item in result.get("data", []):
+        asset = val(item, "AssetData", {}) or {}
+        name = (asset.get("asset_name") or "").strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 
 
 def _resolve_feature_type(alert):

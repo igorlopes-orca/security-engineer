@@ -24,6 +24,7 @@ from orca_client import (
     fetch_alerts,
     get_token,
     list_repositories,
+    repos_with_cve,
 )
 
 
@@ -245,6 +246,67 @@ class TestFieldExtractionConsistency(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Selecting alerts by CVE
+#
+# The CveIds clause is a shape the API rejects outright when it is wrong (a flat
+# str/in clause comes back HTTP 400 "Unknown field 'CveIds'"), and the unit
+# tests can only assert the payload we build — not that Orca still accepts it.
+# ---------------------------------------------------------------------------
+
+class TestCveFilter(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        _skip_no_token()
+        cls.token = get_token()
+        # Pick a CVE from live data rather than hardcoding one: a fixed id ages
+        # out as tenants change, and a test that skips is more useful than a
+        # test that fails for the wrong reason.
+        cls.cve = None
+        for repo in list_repositories(cls.token)[:10]:
+            for alert in fetch_alerts(repo.name, cls.token):
+                if alert.get("cve_ids"):
+                    cls.cve = alert["cve_ids"][0]
+                    cls.repo = repo.name
+                    cls.expected_alert = alert["alert_id"]
+                    return
+        raise unittest.SkipTest("no alert with CveIds found in this tenant")
+
+    def test_every_returned_alert_carries_the_cve(self):
+        alerts = fetch_alerts(self.repo, self.token, cve_ids=[self.cve])
+        self.assertTrue(alerts, f"{self.cve} should match at least one alert")
+        for a in alerts:
+            with self.subTest(alert_id=a["alert_id"]):
+                self.assertIn(self.cve, a["cve_ids"])
+
+    def test_the_source_alert_is_among_them(self):
+        ids = [a["alert_id"]
+               for a in fetch_alerts(self.repo, self.token, cve_ids=[self.cve])]
+        self.assertIn(self.expected_alert, ids)
+
+    def test_lowercase_matches_too(self):
+        """Users type advisory ids however they were pasted."""
+        upper = fetch_alerts(self.repo, self.token, cve_ids=[self.cve])
+        lower = fetch_alerts(self.repo, self.token, cve_ids=[self.cve.lower()])
+        self.assertEqual({a["alert_id"] for a in upper},
+                         {a["alert_id"] for a in lower})
+
+    def test_unknown_cve_returns_nothing(self):
+        """A bogus id must come back empty, not error and not unfiltered."""
+        self.assertEqual(
+            fetch_alerts(self.repo, self.token, cve_ids=["CVE-1999-99999"]), [])
+
+    def test_filter_actually_narrows(self):
+        all_alerts = fetch_alerts(self.repo, self.token)
+        filtered = fetch_alerts(self.repo, self.token, cve_ids=[self.cve])
+        self.assertLessEqual(len(filtered), len(all_alerts))
+
+    def test_repos_with_cve_finds_the_repo(self):
+        found = dict(repos_with_cve([self.cve], self.token))
+        self.assertIn(self.repo, found)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -257,6 +319,7 @@ if __name__ == "__main__":
         TestFetchAlertById,
         TestListRepositories,
         TestFieldExtractionConsistency,
+        TestCveFilter,
     ]
 
     for cls in test_classes:

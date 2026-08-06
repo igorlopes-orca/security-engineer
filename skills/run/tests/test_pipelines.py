@@ -538,6 +538,135 @@ class TestCveVerify(_TreeCase):
 
 
 # ---------------------------------------------------------------------------
+# 3b. The advisory the run was asked for
+#
+# A package alert covers every CVE in its package, and the minimum-safe policy
+# bumps past all of them — so "did the bump work?" and "did it fix the CVE
+# somebody asked about?" are genuinely different questions. Phase 3 answers the
+# first; these cover the second.
+# ---------------------------------------------------------------------------
+
+class TestRequestedCveGate(_TreeCase):
+
+    def _plan(self, requested, target="10.0.1"):
+        return FixPlan(metadata={
+            "package_ref": {"package": "pillow",
+                            "manifest_path": "python-ml/requirements.txt",
+                            "ecosystem": "pypi", "current_version": "8.3.1"},
+            "version_decision": {"target_version": target},
+            "requested_cves": requested,
+        })
+
+    def _verify(self, applied, requested, fetcher):
+        self.write("python-ml/requirements.txt",
+                   _REQUIREMENTS.replace("pillow==8.3.1", f"pillow=={applied}"))
+        pipeline = CvePipeline(fetcher=fetcher, allow_llm_identify=False)
+        return pipeline.verify(_task(), self.root,
+                               self._plan(requested, target=applied))
+
+    def test_requested_cve_cleared_passes(self):
+        got = self._verify("10.0.1", ["CVE-2023-4863"], _pillow_fetcher())
+        self.assertTrue(got.passed, got.failures)
+
+    def test_requested_cve_still_open_fails(self):
+        """The bump landed somewhere the requested advisory still covers."""
+        fetcher = _pillow_fetcher(fixed="11.0.0")
+        got = self._verify("10.0.1", ["CVE-2023-4863"], fetcher)
+        self.assertFalse(got.passed)
+        joined = " ".join(got.failures)
+        self.assertIn("CVE-2023-4863", joined)
+        self.assertIn("asked to fix", joined)
+
+    def test_alias_only_match_is_recognized(self):
+        """OSV collapses CVE+GHSA records for one flaw to a single id.
+
+        The requested CVE then survives only in `aliases`, so an id-only
+        comparison would call a still-vulnerable bump clean.
+        """
+        vuln = _vuln("GHSA-xxxx-yyyy-zzzz",
+                     [{"introduced": "0"}, {"fixed": "11.0.0"}])
+        vuln["aliases"] = ["CVE-2023-4863"]
+        fetcher = FakeFetcher(vulns=[vuln],
+                              versions=["8.3.1", "10.0.1", "11.0.0"])
+        got = self._verify("10.0.1", ["CVE-2023-4863"], fetcher)
+        self.assertFalse(got.passed)
+        self.assertIn("CVE-2023-4863", " ".join(got.failures))
+
+    def test_alias_cleared_passes(self):
+        vuln = _vuln("GHSA-xxxx-yyyy-zzzz",
+                     [{"introduced": "0"}, {"fixed": "10.0.1"}])
+        vuln["aliases"] = ["CVE-2023-4863"]
+        fetcher = FakeFetcher(vulns=[vuln],
+                              versions=["8.3.1", "10.0.1", "11.0.0"])
+        got = self._verify("10.0.1", ["CVE-2023-4863"], fetcher)
+        self.assertTrue(got.passed, got.failures)
+
+    def test_case_insensitive_match(self):
+        got = self._verify("10.0.1", ["cve-2023-4863"],
+                           _pillow_fetcher(fixed="11.0.0"))
+        self.assertFalse(got.passed)
+
+    def test_unrelated_requested_cve_does_not_fail_the_bump(self):
+        """Only the requested advisory gates; the package's others are the
+        existing package-wide check's business."""
+        got = self._verify("10.0.1", ["CVE-1999-0001"],
+                           _pillow_fetcher(fixed="11.0.0"))
+        # 10.0.1 is still covered by CVE-2023-4863, but that is not what was
+        # asked for, and the target matches — so this gate stays quiet.
+        self.assertTrue(got.passed, got.failures)
+
+    def test_osv_outage_fails_open(self):
+        """An unreachable OSV must cost the check, not the fix."""
+        got = self._verify("10.0.1", ["CVE-2023-4863"],
+                           FakeFetcher(raises=RuntimeError("HTTP 503")))
+        self.assertTrue(got.passed, got.failures)
+
+    def test_no_requested_cve_skips_the_gate(self):
+        """A run that named no advisory behaves exactly as it did before."""
+        self.write("python-ml/requirements.txt",
+                   _REQUIREMENTS.replace("pillow==8.3.1", "pillow==10.0.1"))
+        pipeline = CvePipeline(fetcher=_pillow_fetcher(fixed="11.0.0"),
+                               allow_llm_identify=False)
+        plan = self._plan([], target="10.0.1")
+        with patch.object(CvePipeline, "_requested_still_open") as gate:
+            got = pipeline.verify(_task(), self.root, plan)
+        gate.assert_not_called()
+        self.assertTrue(got.passed, got.failures)
+
+
+class TestRequestedCveReachesTheAgent(_TreeCase):
+    """prepare() has to hand the advisory on, or nothing downstream knows it."""
+
+    def _prepare(self, requested):
+        self.write("python-ml/requirements.txt", _REQUIREMENTS)
+        task = _task()
+        task.requested_cves = requested
+        pipeline = CvePipeline(fetcher=_pillow_fetcher(),
+                               allow_llm_identify=False)
+        return pipeline.prepare(task, self.root)
+
+    def test_metadata_carries_the_request(self):
+        plan = self._prepare(["CVE-2023-4863"])
+        self.assertEqual(plan.metadata["requested_cves"], ["CVE-2023-4863"])
+
+    def test_directive_names_the_advisory(self):
+        plan = self._prepare(["CVE-2023-4863"])
+        self.assertIn("CVE-2023-4863", plan.prompt_extra)
+        self.assertIn("do not narrow the bump", plan.prompt_extra)
+
+    def test_directive_unchanged_without_a_request(self):
+        """No advisory named means the prompt the agent has always seen."""
+        plan = self._prepare([])
+        self.assertEqual(plan.metadata["requested_cves"], [])
+        self.assertNotIn("This alert was selected because", plan.prompt_extra)
+
+    def test_target_version_still_stated(self):
+        """The requested-CVE line must not displace the actual instruction."""
+        plan = self._prepare(["CVE-2023-4863"])
+        self.assertIn("Set **pillow** to exactly **10.0.1**", plan.prompt_extra)
+
+
+# ---------------------------------------------------------------------------
 # 4. Orchestrator wiring
 # ---------------------------------------------------------------------------
 
@@ -902,6 +1031,38 @@ class TestWhatChangedSection(unittest.TestCase):
         meta["version_decision"]["advisories_unknown_scope"] = ["CVE-9999-2"]
         self.assertIn("Not assessable", self._body(FixPlan(metadata=meta)))
 
+    def test_names_the_requested_advisory(self):
+        """A reviewer who opened this PR looking for one CVE has to find it.
+
+        The alert covers a whole package, so the trigger is not otherwise
+        recoverable from the diff or the version decision.
+        """
+        meta = copy.deepcopy(_DECISION)
+        meta["requested_cves"] = ["CVE-2023-4863"]
+        body = self._body(FixPlan(metadata=meta))
+        self.assertIn("**Requested:**", body)
+        self.assertIn("CVE-2023-4863", body)
+
+    def test_says_how_much_wider_the_bump_went(self):
+        """_DECISION clears two advisories; one was requested, so one is extra."""
+        meta = copy.deepcopy(_DECISION)
+        meta["requested_cves"] = ["CVE-2023-4863"]
+        body = self._body(FixPlan(metadata=meta))
+        self.assertIn("1 other advisory on the same package", body)
+
+    def test_pluralizes_the_extra_count(self):
+        meta = copy.deepcopy(_DECISION)
+        meta["requested_cves"] = ["CVE-2023-4863"]
+        meta["version_decision"]["advisories_cleared"] = [
+            "CVE-2023-4863", "CVE-1", "CVE-2", "CVE-3"]
+        self.assertIn("3 other advisories on the same package",
+                      self._body(FixPlan(metadata=meta)))
+
+    def test_no_requested_line_without_a_request(self):
+        """A severity-driven run's PR body is unchanged."""
+        self.assertNotIn("**Requested:**",
+                         self._body(FixPlan(metadata=copy.deepcopy(_DECISION))))
+
     # (description, plan) — falls back to the agent's summary
     FALLBACK_CASES = [
         ("no plan", None),
@@ -1155,6 +1316,8 @@ if __name__ == "__main__":
         TestGenericPipelineIsUnchanged,
         TestCvePrepare,
         TestCveVerify,
+        TestRequestedCveGate,
+        TestRequestedCveReachesTheAgent,
         TestOrchestratorUsesThePipeline,
         TestNextCandidateHint,
         TestEcosystemFragments,
@@ -1165,6 +1328,17 @@ if __name__ == "__main__":
         TestVersionDataConfig,
         TestAlertPassthrough,
     ]
+
+    # Same guard as test_orchestrator.py: an unregistered class does not fail,
+    # it silently never runs, which is indistinguishable from passing.
+    _missing = sorted(
+        {name for name, obj in list(globals().items())
+         if isinstance(obj, type) and issubclass(obj, unittest.TestCase)
+         and obj not in (unittest.TestCase, _TreeCase)}
+        - {cls.__name__ for cls in test_classes})
+    if _missing:
+        sys.exit(f"Test classes defined but never run — add them to "
+                 f"test_classes: {', '.join(_missing)}")
 
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))

@@ -1,7 +1,7 @@
 ---
 name: run
-description: Remediate Orca Security alerts end to end — fix, validate, assess production impact, open a PR, notify. Use whenever someone asks to fix, remediate, patch, triage, or scan security alerts, vulnerabilities, or findings, whether they name a severity ("remediate all high vulnerabilities", "patch the critical ones"), a type ("fix the SAST issues", "clean up the hardcoded secrets", "bump the vulnerable dependencies", "fix the Dockerfile findings"), a count ("just one", "max of 3"), an alert ID ("remediate alert-192901290", "fix orca-4060720"), or a repo ("fix everything in owner/repo", "scan all our repos"). Also covers dry runs and read-only risk reports. Covers CVE/SCA, SAST, IaC, and secret findings.
-argument-hint: "[risk_levels,feature_types] [--scan] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
+description: Remediate Orca Security alerts end to end — fix, validate, assess production impact, open a PR, notify. Use whenever someone asks to fix, remediate, patch, triage, or scan security alerts, vulnerabilities, or findings, whether they name a severity ("remediate all high vulnerabilities", "patch the critical ones"), a type ("fix the SAST issues", "clean up the hardcoded secrets", "bump the vulnerable dependencies", "fix the Dockerfile findings"), a CVE or advisory id ("fix CVE-2020-7471", "are we exposed to log4shell", "patch GHSA-2p49-hgcm-8545", "where is CVE-2021-44228 open"), a count ("just one", "max of 3"), an alert ID ("remediate alert-192901290", "fix orca-4060720"), or a repo ("fix everything in owner/repo", "scan all our repos"). Also covers dry runs and read-only risk reports. Covers CVE/SCA, SAST, IaC, and secret findings.
+argument-hint: "[risk_levels,feature_types] [--scan] [--cve <id>] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
 allowed-tools: Bash
 ---
 
@@ -17,7 +17,7 @@ There are two ways in, and they end at the same command:
 
 | The user typed | What you do |
 |---|---|
-| Flags — `/security-engineer:script high,cve --max 3`, or any message containing `--scan`, `--dry-run`, `--alert`, `--max`, `--remote`, or a bare filter token like `high,cve` | **Pass them through verbatim.** Do not re-derive, reorder, add, or drop a single flag. |
+| Flags — `/security-engineer:script high,cve --max 3`, or any message containing `--scan`, `--dry-run`, `--alert`, `--cve`, `--max`, `--remote`, or a bare filter token like `high,cve` | **Pass them through verbatim.** Do not re-derive, reorder, add, or drop a single flag. |
 | Plain English — "remediate all high vulnerabilities with max of 3" | Translate with the tables in §1. |
 
 If a message mixes both — "fix the high CVEs, `--dry-run`" — the explicit flag is
@@ -59,6 +59,8 @@ no spaces (`high`, `cve`, `high,cve`, `critical,sast`). Severity is cumulative �
 | "dry run", "plan it", "show me what it would do", "don't change anything" | `--dry-run` |
 | "scan", "list the risks", "what's open", "report only, don't fix" | `--scan` |
 | a specific alert | `--alert orca-4060720` |
+| a named CVE or advisory — "fix CVE-2020-7471", "patch log4shell", "are we exposed to GHSA-2p49-hgcm-8545" | `--cve CVE-2020-7471` |
+| "where is CVE-X open?", "which repos have it?" | `--scan --cve CVE-X --remote all` |
 | "in owner/repo", "against owner/repo" | `--remote owner/repo` |
 | "all our repos", "every repo", "org-wide" | `--remote all` |
 
@@ -67,6 +69,9 @@ no spaces (`high`, `cve`, `high,cve`, `critical,sast`). Severity is cumulative �
 | Request | Command |
 |---|---|
 | "remediate alert-192901290" | `security-engineer --alert alert-192901290` |
+| "fix CVE-2020-7471" | `security-engineer --cve CVE-2020-7471` |
+| "is CVE-2021-44228 anywhere in our repos?" | `security-engineer --scan --cve CVE-2021-44228 --remote all` |
+| "patch CVE-2020-7471 in acme/api" | `security-engineer --cve CVE-2020-7471 --remote acme/api` |
 | "remediate all high vulnerabilities with max of 3" | `security-engineer high --max 3` |
 | "fix one SAST issue" | `security-engineer sast --max 1` |
 | "patch the critical CVEs" | `security-engineer critical,cve` |
@@ -85,6 +90,14 @@ no spaces (`high`, `cve`, `high,cve`, `critical,sast`). Severity is cumulative �
 - **"vulnerabilities" alone is not `cve`.** Used loosely it means all finding
   types — pass no type token. Only use `cve` when the request points at
   packages, dependencies, libraries, CVE numbers, or SCA.
+- **A named advisory is `--cve`, not the `cve` filter token.** `cve` means "all
+  package findings"; `--cve CVE-2020-7471` means that one advisory. Pass the id
+  as the user wrote it — `cve-2020-7471` and `GHSA-...` are normalized by the
+  orchestrator. A CVE with no repo named runs against the current repo, like
+  every other filter; if it is not open here, the run says which repos do carry
+  it. **Do not add `--remote all` unless the user asked to search everywhere.**
+- **A named CVE is a scope, so it does not need confirming.** The unbounded-run
+  rule below does not apply to `--cve`: it is as specific as `--alert`.
 - **Never add `--remote` when the user is working in the current repo.** With no
   `--remote`, the orchestrator auto-detects the repo from the git remote.
 - **`--scan` is read-only** and rejects `--dry-run`, `--alert`, and `--max`. If
@@ -142,6 +155,9 @@ security-engineer high,cve --max 3          # shell, or what this skill runs
 /security-engineer:script --alert orca-270453         -> fix one specific alert (live)
 /security-engineer:script --alert orca-270453 --dry-run -> plan one specific alert
 /security-engineer:script --max 3 cve                 -> cap at 3 CVE fixes
+/security-engineer:script --cve CVE-2020-7471         -> fix whatever carries this advisory
+/security-engineer:script --cve CVE-1,CVE-2           -> either advisory (also: repeat --cve)
+/security-engineer:script CVE-2020-7471               -> same, as a bare positional
 
 # Remote mode — clones repos, runs full pipeline, cleans up
 /security-engineer:script --remote owner/repo              -> clone owner/repo, fix all alerts
@@ -161,7 +177,27 @@ security-engineer high,cve --max 3          # shell, or what this skill runs
 /security-engineer:script --scan sast,iac                  -> list SAST and IaC risks
 /security-engineer:script --scan --remote owner/repo       -> list risks for a remote repo
 /security-engineer:script --scan --remote all              -> list risks across all repos
+/security-engineer:script --scan --cve CVE-2020-7471       -> is this advisory open here?
+/security-engineer:script --scan --cve CVE-2020-7471 --remote all
+                                                           -> every repo carrying it
 ```
+
+### Finding a CVE without a run
+
+`find-cve` answers "where is this open?" on its own — one API query, no clone,
+no git, no fix. It sits beside `orchestrator.py` in the plugin's `skills/run/`:
+
+```bash
+python3 run_agent.py find-cve CVE-2020-7471
+{
+  "cve_ids": ["CVE-2020-7471"],
+  "repos": [{"repo": "acme/api", "alert_count": 2}],
+  "total_alerts": 2
+}
+```
+
+A `--cve` run that matches nothing in the current repo prints the same
+information automatically, along with the command to fix it where it is.
 
 ## Flag Compatibility
 
@@ -170,6 +206,7 @@ security-engineer high,cve --max 3          # shell, or what this skill runs
 | `filters` (positional) | Yes | Yes | `high,cve`, `sast`, etc. |
 | `--dry-run` | Yes | **Error** | Scan is inherently read-only |
 | `--alert <id>` | Yes | **Error** | Use `--alert` without `--scan` to fix it |
+| `--cve <id>` | Yes | Yes | Narrows the list; conflicts with `--alert` |
 | `--max N` | Yes | **Error** | No fixing = no cap needed |
 | `--remote <repo\|all>` | Yes | Yes | In scan mode: API query only, no clone |
 
@@ -178,6 +215,7 @@ Invalid combinations produce a clear error:
 Error: --scan and --dry-run cannot be combined. --scan already lists alerts without fixing.
 Error: --scan and --alert cannot be combined. To fix a single alert, drop --scan.
 Error: --scan and --max cannot be combined. --scan lists all matching alerts.
+Error: --cve and --alert cannot be combined. Both choose which alerts to fix; pass one.
 ```
 
 ## Filter Rules
@@ -195,6 +233,20 @@ Error: --scan and --max cannot be combined. --scan lists all matching alerts.
 - `secret` -> hardcoded credentials
 
 Combine with comma: `high,cve` = high+ severity AND CVE type. Both conditions must match.
+
+**Advisory ids** (`--cve CVE-2020-7471`, or as a positional token) select the
+alerts carrying that CVE or GHSA id, filtered server-side by Orca. Case does not
+matter and the id is canonicalized before it is used. Composes with the tokens
+above: `security-engineer high --cve CVE-2020-7471` is high+ severity *and* that
+advisory.
+
+**One alert is a whole package, not one CVE.** Orca raises a package alert per
+vulnerable dependency and lists every advisory against it — the django alert in
+one sandbox repo carries 41. So a `--cve` run selects package alerts, and the
+minimum-safe bump (see CVE Version Decisions) clears *all* of that package's
+advisories, not only the one named. The plan output says how many, the PR body
+names the requested one, and Phase 3 fails the fix if the applied version still
+leaves the requested advisory open.
 
 ## --dry-run Guarantees
 
@@ -239,8 +291,10 @@ For each alert (up to 4 in parallel, isolated git worktree per alert):
                               files count; size limit from the pipeline
   5. validate (Phase 2)     -> LLM: does the fix address the vulnerability?
   6. pipeline.verify        -> Phase 3. CVE: the manifest actually pins the
-                              resolved version, the lockfile agrees, and the
-                              applied version carries no known advisory.
+                              resolved version, the lockfile agrees, the applied
+                              version carries no known advisory, and — on a
+                              --cve run — the requested advisory is genuinely
+                              cleared by it.
                               Other types: local build (see Language Coverage)
   7. impact_agent           -> claude subprocess: diff + the resolved bump
                               distance -> production risk JSON
@@ -330,6 +384,12 @@ package-wide, not just for the alert's own CVE, so a bump cannot land on a
 different known vulnerability. Crossing a major boundary is not refused, because
 some packages have no safe release inside the current major; instead the distance
 is classified (`bump_class`, `majors_crossed`) and handed to impact analysis.
+
+This policy is what makes a `--cve` run go wider than the advisory named: the
+target clears the requested CVE *and* the package's others. Phase 3 confirms the
+requested one specifically, matching OSV aliases as well as ids — OSV collapses
+the CVE and GHSA records for one flaw into a single id, so the requested CVE
+often survives only as an alias.
 
 **Ecosystems:** PyPI, npm, Go, Maven, Cargo, RubyGems, NuGet. The ecosystem comes
 from the manifest filename in the alert's `source`; the package name is whichever

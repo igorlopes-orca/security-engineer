@@ -9,6 +9,7 @@ Usage: python3 run_agent.py <subcommand> [options]
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,8 @@ from orca_client import (
     fetch_alerts,
     get_token,
     is_fixable,
+    normalize_cve_id,
+    repos_with_cve,
 )
 from version_data import ecosystem_for_manifest, resolve_bump, resolve_ecosystem
 
@@ -54,28 +57,59 @@ def detect_repo():
     return None
 
 
+# An advisory id used as a filter token. Matched before the unknown-token
+# warning, because dropping one is not a cosmetic loss: `security-engineer
+# CVE-2020-7471` would otherwise discard the token and run unfiltered, fixing
+# every open alert in the repo when the user named exactly one thing.
+_ADVISORY_TOKEN_RE = re.compile(
+    r"^(?:CVE|GHSA|PYSEC|GO|RUSTSEC|OSV)-[A-Za-z0-9.-]+$", re.IGNORECASE)
+
+
 def parse_filter(filter_str):
-    """Parse comma-separated risk levels and feature types from a filter string."""
+    """Parse risk levels, feature types and advisory ids from a filter string.
+
+    Returns (levels, types, cve_ids); each is None when nothing of that kind was
+    named, so a caller can tell "not filtered" from "filtered to nothing".
+    """
     valid_levels = set(RISK_ORDER)
     valid_types = {"sast", "iac", "secret", "cve", "scm_posture"}
 
     levels = []
     types = []
+    cve_ids = []
     unknown = []
 
-    for token in filter_str.split(","):
-        token = token.strip().lower()
+    for raw in filter_str.split(","):
+        token = raw.strip().lower()
         if token in valid_levels:
             levels.append(token)
         elif token in valid_types:
             types.append(token)
+        elif _ADVISORY_TOKEN_RE.match(raw.strip()):
+            cve_ids.append(normalize_cve_id(raw))
         elif token:
             unknown.append(token)
 
     if unknown:
         print(f"Warning: ignoring unknown filter tokens: {unknown}", file=sys.stderr)
 
-    return levels or None, types or None
+    return levels or None, types or None, cve_ids or None
+
+
+def parse_cve_args(values):
+    """Flatten repeated and comma-joined --cve values into normalized ids.
+
+    `--cve CVE-1,CVE-2` and `--cve CVE-1 --cve CVE-2` mean the same thing; both
+    reach here as a list because argparse appends.
+    """
+    ids = []
+    for value in values or []:
+        for part in str(value).split(","):
+            part = part.strip()
+            if part:
+                ids.append(normalize_cve_id(part))
+    # Deduplicate, preserving the order the user wrote them in.
+    return list(dict.fromkeys(ids))
 
 
 def min_level_from_list(levels):
@@ -100,6 +134,7 @@ def _alert_to_entry(a):
         "score":         a["score"],
         "feature_type":  _resolve_feature_type(a),
         "source":        a["source"],
+        "cve_ids":       a.get("cve_ids", []),
         "is_fixable":    is_fixable(a),
         "branch_exists": branch_exists_remote(branch),
         "branch_name":   branch,
@@ -133,11 +168,17 @@ def cmd_list_alerts(args):
     if not repo:
         sys.exit("Error: could not detect repo. Pass repo as argument.")
 
-    levels, types = parse_filter(args.filter) if args.filter else (None, None)
+    levels, types, filter_cves = (parse_filter(args.filter) if args.filter
+                                  else (None, None, None))
     min_level = min_level_from_list(levels)
+    # An advisory id can arrive either way; a run naming it twice should not
+    # narrow to nothing, so the two sources are merged rather than overriding.
+    cve_ids = parse_cve_args(getattr(args, "cve", None)) + list(filter_cves or [])
+    cve_ids = list(dict.fromkeys(cve_ids)) or None
 
     try:
-        alerts = fetch_alerts(repo, token, min_level=min_level, feature_types=types)
+        alerts = fetch_alerts(repo, token, min_level=min_level,
+                              feature_types=types, cve_ids=cve_ids)
     except RuntimeError as e:
         print(json.dumps({"error": str(e)}))
         sys.exit(1)
@@ -152,6 +193,7 @@ def cmd_list_alerts(args):
 
     output = {
         "dry_run": getattr(args, "dry_run", False),
+        "cve_ids": cve_ids or [],
         "alerts": result,
     }
     print(json.dumps(output, indent=2))
@@ -170,6 +212,32 @@ def cmd_get_alert(args):
         sys.exit(1)
 
     print(json.dumps(alert, indent=2))
+
+
+def cmd_find_cve(args):
+    """Print which code repositories have an open alert carrying a CVE.
+
+    Standalone like `resolve-version`, and for the same reason: "where is this
+    CVE open?" is the question that comes before any fix, and answering it
+    should not mean starting one. Read-only — one API query, no clone, no git.
+    """
+    cve_ids = parse_cve_args(args.cve_ids)
+    if not cve_ids:
+        print(json.dumps({"error": "no advisory ids given"}))
+        sys.exit(1)
+
+    token = get_token()
+    try:
+        repos = repos_with_cve(cve_ids, token)
+    except RuntimeError as e:
+        print(json.dumps({"error": str(e)}))
+        sys.exit(1)
+
+    print(json.dumps({
+        "cve_ids": cve_ids,
+        "repos": [{"repo": name, "alert_count": n} for name, n in repos],
+        "total_alerts": sum(n for _, n in repos),
+    }, indent=2))
 
 
 def cmd_resolve_version(args):
@@ -272,6 +340,9 @@ def main():
     p_list.add_argument("--filter", default=None,
                         help="Comma-separated risk levels and/or feature types (e.g. 'high,sast')")
     p_list.add_argument("--alert", default=None, help="Target a single alert ID instead of bulk fetch")
+    p_list.add_argument("--cve", action="append", default=None,
+                        help="Only alerts carrying this advisory id "
+                             "(repeatable, or comma-separated)")
     p_list.add_argument("--max", type=int, default=None, help="Max number of alerts to return")
     p_list.add_argument("--fixable-only", action="store_true", help="Only return fixable alerts")
     p_list.add_argument("--dry-run", action="store_true", help="Signal dry-run mode in output")
@@ -281,6 +352,12 @@ def main():
     # get-alert
     p_get = sub.add_parser("get-alert", help="Fetch single alert as JSON")
     p_get.add_argument("alert_id")
+
+    # find-cve — read-only "where is this CVE open?"
+    p_find = sub.add_parser("find-cve",
+                            help="Which repos have an open alert for a CVE (JSON)")
+    p_find.add_argument("cve_ids", nargs="+",
+                        help="Advisory ids, e.g. CVE-2020-7471 GHSA-2p49-hgcm-8545")
 
     # resolve-version — no Orca token needed
     p_ver = sub.add_parser("resolve-version",
@@ -319,6 +396,7 @@ def main():
     dispatch = {
         "list-alerts": cmd_list_alerts,
         "get-alert":   cmd_get_alert,
+        "find-cve":    cmd_find_cve,
         "resolve-version": cmd_resolve_version,
         "git-setup":   cmd_git_setup,
         "git-commit":  cmd_git_commit,
