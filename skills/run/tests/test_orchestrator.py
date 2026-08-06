@@ -156,12 +156,23 @@ class TestFlagValidation(unittest.TestCase):
          "--scan and --alert cannot be combined"),
         ("--scan + --max", {"scan": True, "dry_run": False, "alert": None, "max": 3},
          "--scan and --max cannot be combined"),
+        # Both name which alerts to fix, and they can disagree — an alert id
+        # that does not carry the CVE would leave the run with nothing to do and
+        # no way to say which flag was wrong.
+        ("--cve + --alert", {"scan": False, "dry_run": False, "alert": "orca-1",
+                             "max": None, "cve_ids": ["CVE-2020-7471"]},
+         "--cve and --alert cannot be combined"),
+        ("--cve + --alert under --scan", {"scan": True, "dry_run": False,
+                                          "alert": "orca-1", "max": None,
+                                          "cve_ids": ["CVE-2020-7471"]},
+         "--cve and --alert cannot be combined"),
     ]
 
     def test_invalid_combos(self):
         import argparse
         for desc, kwargs, expected_msg in self.INVALID_COMBOS:
             with self.subTest(desc):
+                kwargs = {"cve_ids": [], **kwargs}
                 args = argparse.Namespace(**kwargs, remote=None, filter_tokens=None,
                                           repo=None, positional=[])
                 with self.assertRaises(SystemExit) as ctx:
@@ -173,12 +184,23 @@ class TestFlagValidation(unittest.TestCase):
         ("no --scan with --dry-run", {"scan": False, "dry_run": True, "alert": None, "max": None}),
         ("no --scan with --alert", {"scan": False, "dry_run": False, "alert": "orca-1", "max": None}),
         ("no flags", {"scan": False, "dry_run": False, "alert": None, "max": None}),
+        # --cve narrows the list rather than fixing anything, so unlike
+        # --dry-run/--alert/--max it is legal in scan mode.
+        ("--scan + --cve", {"scan": True, "dry_run": False, "alert": None,
+                            "max": None, "cve_ids": ["CVE-2020-7471"]}),
+        ("--cve alone", {"scan": False, "dry_run": False, "alert": None,
+                         "max": None, "cve_ids": ["CVE-2020-7471"]}),
+        ("--cve + --dry-run", {"scan": False, "dry_run": True, "alert": None,
+                               "max": None, "cve_ids": ["CVE-2020-7471"]}),
+        ("--cve + --max", {"scan": False, "dry_run": False, "alert": None,
+                           "max": 2, "cve_ids": ["CVE-2020-7471"]}),
     ]
 
     def test_valid_combos(self):
         import argparse
         for desc, kwargs in self.VALID_COMBOS:
             with self.subTest(desc):
+                kwargs = {"cve_ids": [], **kwargs}
                 args = argparse.Namespace(**kwargs, remote=None, filter_tokens=None,
                                           repo=None, positional=[])
                 _validate_flags(args)  # should not raise
@@ -240,6 +262,212 @@ class TestNormalizeAlertId(unittest.TestCase):
                     main(["--alert", raw])
                     plan.assert_called_once()
                     self.assertEqual(plan.call_args[0][0].alert, expected)
+
+
+# ---------------------------------------------------------------------------
+# 1bc. Selecting alerts by CVE
+#
+# A repo CVE alert is one *package*, not one CVE — Orca's django alert carries
+# 41 advisory ids — so "fix CVE-2020-7471" has to resolve to whole-package
+# alerts, and the run has to keep hold of which advisory was actually asked for.
+# ---------------------------------------------------------------------------
+
+class TestNormalizeCveId(unittest.TestCase):
+
+    CASES = [
+        ("canonical id is unchanged",     "CVE-2020-7471", "CVE-2020-7471"),
+        ("lowercase scheme is raised",    "cve-2020-7471", "CVE-2020-7471"),
+        ("mixed-case scheme is raised",   "Cve-2020-7471", "CVE-2020-7471"),
+        ("surrounding whitespace is dropped", " CVE-2020-7471 ", "CVE-2020-7471"),
+        # A GHSA body is lowercase by construction, so uppercasing the whole
+        # string would invent an id that was never issued.
+        ("GHSA body keeps its case",      "ghsa-2p49-hgcm-8545",
+         "GHSA-2p49-hgcm-8545"),
+        ("GHSA already canonical",        "GHSA-2p49-hgcm-8545",
+         "GHSA-2p49-hgcm-8545"),
+        ("PYSEC scheme is raised",        "pysec-2021-137", "PYSEC-2021-137"),
+        ("unknown scheme passes through", "FOO-bar-1",      "FOO-bar-1"),
+        ("no separator passes through",   "CVE2020",        "CVE2020"),
+        ("None passes through",           None,             None),
+        ("empty string passes through",   "",               ""),
+    ]
+
+    def test_normalize(self):
+        from orca_client import normalize_cve_id
+        for desc, raw, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(normalize_cve_id(raw), expected)
+
+    def test_idempotent(self):
+        from orca_client import normalize_cve_id
+        for desc, _raw, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(normalize_cve_id(expected), expected)
+
+
+class TestParseCveArgs(unittest.TestCase):
+
+    CASES = [
+        ("nothing given",        None,                       []),
+        ("empty list",           [],                         []),
+        ("single flag",          ["CVE-2020-7471"],          ["CVE-2020-7471"]),
+        ("comma-joined",         ["CVE-1234-1,CVE-1234-2"],
+         ["CVE-1234-1", "CVE-1234-2"]),
+        ("repeated flag",        ["CVE-1234-1", "CVE-1234-2"],
+         ["CVE-1234-1", "CVE-1234-2"]),
+        ("normalized on the way in", ["cve-2020-7471"],      ["CVE-2020-7471"]),
+        ("duplicates collapse",  ["CVE-1234-1", "cve-1234-1"], ["CVE-1234-1"]),
+        ("blank segments dropped", ["CVE-1234-1,,  "],       ["CVE-1234-1"]),
+    ]
+
+    def test_parse(self):
+        from run_agent import parse_cve_args
+        for desc, raw, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(parse_cve_args(raw), expected)
+
+
+class TestCveReachesThePipeline(unittest.TestCase):
+    """main() must resolve --cve at the boundary, like it does --alert."""
+
+    # (description, argv, expected args.cve_ids)
+    CASES = [
+        ("single flag",   ["--cve", "CVE-2020-7471"],      ["CVE-2020-7471"]),
+        ("lowercase",     ["--cve", "cve-2020-7471"],      ["CVE-2020-7471"]),
+        ("comma-joined",  ["--cve", "CVE-1,CVE-2"],        ["CVE-1", "CVE-2"]),
+        ("repeated",      ["--cve", "CVE-1", "--cve", "CVE-2"], ["CVE-1", "CVE-2"]),
+        ("with a filter", ["high,cve", "--cve", "CVE-2020-7471"], ["CVE-2020-7471"]),
+        # The footgun: a bare advisory id as a positional used to be discarded
+        # with a warning, widening the run to every open alert in the repo.
+        ("bare positional id", ["CVE-2020-7471"],          ["CVE-2020-7471"]),
+        ("positional plus severity", ["high,CVE-2020-7471"], ["CVE-2020-7471"]),
+        ("no CVE named",  ["high"],                        []),
+    ]
+
+    def test_cve_ids_on_args(self):
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+        for desc, argv, expected in self.CASES:
+            with self.subTest(desc):
+                with patch.object(orchestrator, "_detect_repo", return_value=repo), \
+                     patch.object(orchestrator, "build_notifiers"), \
+                     patch.object(orchestrator, "_print_plan"), \
+                     patch.object(orchestrator, "_print_cve_elsewhere"), \
+                     patch.object(orchestrator, "_fetch_and_plan",
+                                  return_value=([], [], [], [])) as plan:
+                    main(argv)
+                    self.assertEqual(plan.call_args[0][0].cve_ids, expected)
+
+    def test_forwarded_to_list_alerts(self):
+        """_fetch_and_plan must put --cve on the run_agent command line.
+
+        Filtering happens server-side, so a dropped flag does not narrow
+        anything — it silently fixes the whole repo instead.
+        """
+        import argparse
+        args = argparse.Namespace(alert=None, filter_tokens=None, max=None,
+                                  cve_ids=["CVE-2020-7471", "CVE-2021-44228"])
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+        with patch.object(orchestrator, "_run",
+                          return_value=('{"alerts": []}', "", 0)) as run:
+            orchestrator._fetch_and_plan(args, repo)
+        cmd = run.call_args[0][0]
+        self.assertEqual(
+            [cmd[i + 1] for i, tok in enumerate(cmd) if tok == "--cve"],
+            ["CVE-2020-7471", "CVE-2021-44228"])
+
+    def test_requested_cves_ride_on_the_task(self):
+        """The task carries the advisory, so the fix and the PR can name it."""
+        import argparse
+        import json as _json
+        args = argparse.Namespace(alert=None, filter_tokens=None, max=None,
+                                  cve_ids=["CVE-2020-7471"])
+        repo = Repository(name="owner/repo", url="https://github.com/owner/repo")
+        listing = _json.dumps({"alerts": [{
+            "alert_id": "orca-1", "title": "django Package Vulnerabilities",
+            "risk_level": "high", "feature_type": "cve", "source": "./req.txt",
+            "is_fixable": True, "branch_exists": False,
+        }]})
+        with patch.object(orchestrator, "_run",
+                          side_effect=[(listing, "", 0), ("{}", "", 0)]):
+            to_fix, _, _, _ = orchestrator._fetch_and_plan(args, repo)
+        self.assertEqual(to_fix[0].requested_cves, ["CVE-2020-7471"])
+
+
+class TestCveQueryShape(unittest.TestCase):
+    """The CveIds clause is a shape the API rejects outright when wrong.
+
+    CveIds is a list field: a flat {"type": "str", "key": "CveIds"} clause comes
+    back as HTTP 400 "Unknown field 'CveIds'". Asserted on the built payload so
+    a regression shows up here rather than mid-run against a live tenant.
+    """
+
+    def _clause(self, payload, key):
+        return [c for c in payload["query"]["with"]["values"] if c.get("key") == key]
+
+    def test_no_clause_without_cve_ids(self):
+        from orca_client import alerts_payload
+        self.assertEqual(self._clause(alerts_payload("owner/repo"), "CveIds"), [])
+
+    def test_clause_shape(self):
+        from orca_client import alerts_payload
+        clause = self._clause(
+            alerts_payload("owner/repo", cve_ids=["cve-2020-7471"]), "CveIds")[0]
+        self.assertEqual(clause, {
+            "type": "list", "key": "CveIds", "operator": "any_match",
+            "values": [{"type": "str", "key": "CveIds", "operator": "in",
+                        "values": ["CVE-2020-7471"]}],
+        })
+
+    def test_ids_are_normalized_in_the_query(self):
+        from orca_client import alerts_payload
+        clause = self._clause(
+            alerts_payload("owner/repo", cve_ids=["cve-1", "GHSA-aB-c"]), "CveIds")[0]
+        self.assertEqual(clause["values"][0]["values"], ["CVE-1", "GHSA-aB-c"])
+
+    def test_cve_ids_are_selected(self):
+        """Unselected, the field comes back empty and every CVE count reads 0."""
+        from orca_client import alerts_payload, fetch_alert_by_id
+        self.assertIn("CveIds", alerts_payload("owner/repo")["select"])
+        with patch("orca_client._post", return_value={"data": []}) as post:
+            fetch_alert_by_id("orca-1", "tok")
+        self.assertIn("CveIds", post.call_args[0][0]["select"])
+
+    def test_repo_scoped_by_asset_kind_when_no_repo_named(self):
+        """A bare CVE query also matches VMs running the same package.
+
+        Those are real alerts this pipeline cannot fix — no manifest, no repo —
+        so the query has to be pinned to code repositories.
+        """
+        from orca_client import CODE_REPOSITORY_INVENTORY, alerts_payload
+        clauses = alerts_payload(None, cve_ids=["CVE-1"])["query"]["with"]["values"]
+        self.assertIn(CODE_REPOSITORY_INVENTORY, clauses)
+
+    def test_named_repo_still_scopes_by_name(self):
+        from orca_client import CODE_REPOSITORY_INVENTORY, alerts_payload
+        clauses = alerts_payload("owner/repo")["query"]["with"]["values"]
+        self.assertNotIn(CODE_REPOSITORY_INVENTORY, clauses)
+        self.assertTrue(any(c.get("keys") == ["Inventories"] for c in clauses))
+
+
+class TestReposWithCve(unittest.TestCase):
+
+    ITEMS = [
+        {"data": {"AssetData": {"value": {"asset_name": "acme/api"}}}},
+        {"data": {"AssetData": {"value": {"asset_name": "acme/api"}}}},
+        {"data": {"AssetData": {"value": {"asset_name": "acme/web"}}}},
+        {"data": {"AssetData": {"value": {}}}},          # no name — dropped
+    ]
+
+    def test_counts_by_repo(self):
+        from orca_client import repos_with_cve
+        with patch("orca_client._post", return_value={"data": self.ITEMS}):
+            self.assertEqual(repos_with_cve(["CVE-1"], "tok"),
+                             [("acme/api", 2), ("acme/web", 1)])
+
+    def test_empty(self):
+        from orca_client import repos_with_cve
+        with patch("orca_client._post", return_value={"data": []}):
+            self.assertEqual(repos_with_cve(["CVE-1"], "tok"), [])
 
 
 # ---------------------------------------------------------------------------
@@ -333,47 +561,38 @@ class TestScanReport(unittest.TestCase):
 
 class TestFilterParsing(unittest.TestCase):
 
-    def test_cve_only(self):
-        levels, types = parse_filter("cve")
-        self.assertIsNone(levels)
-        self.assertEqual(types, ["cve"])
+    # (description, filter string, (levels, types, cve_ids))
+    CASES = [
+        ("type alone",            "cve",       (None, ["cve"], None)),
+        ("sast alone",            "sast",      (None, ["sast"], None)),
+        ("level alone",           "high",      (["high"], None, None)),
+        ("level and type",        "high,cve",  (["high"], ["cve"], None)),
+        ("critical sast",         "critical,sast", (["critical"], ["sast"], None)),
+        ("two types",             "high,sast,iac", (["high"], ["sast", "iac"], None)),
+        ("unknown token dropped", "high,unknowntoken", (["high"], None, None)),
+        ("empty string",          "",          (None, None, None)),
+        # An advisory id is a selector, not noise. Dropping it would widen the
+        # run from one package to every open alert in the repo.
+        ("bare CVE",              "CVE-2020-7471",
+         (None, None, ["CVE-2020-7471"])),
+        ("lowercase CVE canonicalized", "cve-2020-7471",
+         (None, None, ["CVE-2020-7471"])),
+        ("GHSA keeps its lowercase body", "ghsa-2p49-hgcm-8545",
+         (None, None, ["GHSA-2p49-hgcm-8545"])),
+        ("level plus CVE",        "high,CVE-2020-7471",
+         (["high"], None, ["CVE-2020-7471"])),
+        ("type plus CVE",         "cve,CVE-2020-7471",
+         (None, ["cve"], ["CVE-2020-7471"])),
+        ("two CVEs",              "CVE-2020-7471,CVE-2021-44228",
+         (None, None, ["CVE-2020-7471", "CVE-2021-44228"])),
+        ("CVE beside an unknown token", "CVE-2020-7471,bogus",
+         (None, None, ["CVE-2020-7471"])),
+    ]
 
-    def test_sast_only(self):
-        levels, types = parse_filter("sast")
-        self.assertIsNone(levels)
-        self.assertEqual(types, ["sast"])
-
-    def test_high_only(self):
-        levels, types = parse_filter("high")
-        self.assertEqual(levels, ["high"])
-        self.assertIsNone(types)
-
-    def test_high_and_cve(self):
-        levels, types = parse_filter("high,cve")
-        self.assertEqual(levels, ["high"])
-        self.assertEqual(types, ["cve"])
-
-    def test_critical_sast(self):
-        levels, types = parse_filter("critical,sast")
-        self.assertEqual(levels, ["critical"])
-        self.assertEqual(types, ["sast"])
-
-    def test_multiple_types(self):
-        levels, types = parse_filter("high,sast,iac")
-        self.assertEqual(levels, ["high"])
-        self.assertIn("sast", types)
-        self.assertIn("iac", types)
-
-    def test_unknown_token_ignored(self):
-        """Unknown tokens must be silently dropped, not crash."""
-        levels, types = parse_filter("high,unknowntoken")
-        self.assertEqual(levels, ["high"])
-        self.assertIsNone(types)  # "unknowntoken" is not a valid type
-
-    def test_empty_string(self):
-        levels, types = parse_filter("")
-        self.assertIsNone(levels)
-        self.assertIsNone(types)
+    def test_parse_filter(self):
+        for desc, raw, expected in self.CASES:
+            with self.subTest(desc):
+                self.assertEqual(parse_filter(raw), expected)
 
 
 # ---------------------------------------------------------------------------
@@ -2213,8 +2432,25 @@ if __name__ == "__main__":
         TestSubprocessErrorDetail,
         TestNoDuplicateImpactRendering,
         TestNormalizeAlertId,
+        TestNormalizeCveId,
+        TestParseCveArgs,
+        TestCveReachesThePipeline,
+        TestCveQueryShape,
+        TestReposWithCve,
         TestLocalFetchFailureIsReported,
     ]
+
+    # The list above is hand-maintained, so a new test class that nobody adds to
+    # it does not fail — it silently never runs, which looks exactly like
+    # passing. Name the gap instead.
+    _registered = {cls.__name__ for cls in test_classes}
+    _defined = {name for name, obj in list(globals().items())
+                if isinstance(obj, type) and issubclass(obj, unittest.TestCase)
+                and obj is not unittest.TestCase}
+    _missing = sorted(_defined - _registered)
+    if _missing:
+        sys.exit(f"Test classes defined but never run — add them to "
+                 f"test_classes: {', '.join(_missing)}")
 
     for cls in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(cls))

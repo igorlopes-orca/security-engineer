@@ -99,11 +99,13 @@ class CvePipeline(FixPipeline):
                            metadata={"package_ref": ref.to_dict(),
                                      "version_decision": decision.to_dict()})
 
+        requested = list(getattr(task, "requested_cves", None) or [])
         metadata = {"package_ref": ref.to_dict(),
-                    "version_decision": decision.to_dict()}
+                    "version_decision": decision.to_dict(),
+                    "requested_cves": requested}
         plan = FixPlan(
             summary=decision.rationale,
-            prompt_extra=self._directive(ref, decision),
+            prompt_extra=self._directive(ref, decision, requested),
             metadata=metadata,
             # A bump we could not classify, or one that leaves advisories behind,
             # is not something to merge unread.
@@ -114,14 +116,26 @@ class CvePipeline(FixPipeline):
         )
         return plan
 
-    def _directive(self, ref, decision) -> str:
+    def _directive(self, ref, decision, requested_cves=None) -> str:
         """The instruction the agent gets instead of a research task."""
         lines = [
             "## Target Version (already decided — do not choose another)",
             "",
             (f"Set **{ref.package}** to exactly **{decision.target_version}** "
              f"in `{ref.manifest_path}`."),
-            "",
+            "",]
+        if requested_cves:
+            # Without this the agent only sees a package alert and may reason
+            # its way to the *smallest* bump that fixes the headline CVE. The
+            # target below already clears the requested one along with the rest.
+            lines += [
+                (f"This alert was selected because it carries "
+                 f"{', '.join(requested_cves)}. The target version below clears "
+                 "it along with the package's other advisories — do not narrow "
+                 "the bump to that one advisory."),
+                "",
+            ]
+        lines += [
             f"- Ecosystem: {ref.ecosystem.key}",
             f"- Currently declared: {ref.current_version}"
             + ("" if ref.exact_pin else " (a range, not an exact pin)"),
@@ -214,6 +228,15 @@ class CvePipeline(FixPipeline):
         if lock_failure:
             failures.append(lock_failure)
 
+        requested = (plan.metadata.get("requested_cves") if plan else None) or []
+        if applied and requested:
+            still_open = self._requested_still_open(ref, applied, requested)
+            if still_open:
+                failures.append(
+                    f"{package} was bumped to {applied}, but "
+                    f"{', '.join(still_open)} — the advisory this run was asked "
+                    "to fix — still covers that version")
+
         if failures:
             return ValidationResult(passed=False, phase="local_build",
                                     failures=failures)
@@ -273,6 +296,39 @@ class CvePipeline(FixPipeline):
         if pa is None or pb is None:
             return str(a).strip() == str(b).strip()
         return pa.sort_key() == pb.sort_key()
+
+    def _requested_still_open(self, ref: dict, version: str,
+                              requested: list) -> list:
+        """Which of the requested advisories still cover the applied version.
+
+        Matched against each scope's aliases as well as its id: OSV groups the
+        CVE and GHSA records describing one flaw, and `_preferred_id` collapses
+        the group to a single id — so a requested CVE routinely survives only as
+        an alias. Comparing ids alone would miss it and report a clean bump as a
+        failure.
+
+        Fails *open*, like `_is_vulnerable`: an unreachable OSV must cost us the
+        check, not the fix.
+        """
+        eco = self._ecosystem(ref)
+        parsed = parse_version(version)
+        if eco is None or parsed is None or not requested:
+            return []
+        try:
+            fetcher = self.fetcher or VersionDataFetcher()
+            vulns = fetcher.osv_advisories(ref.get("package", ""), eco)
+        except Exception:
+            return []
+
+        wanted = {str(c).upper() for c in requested}
+        still_open = []
+        for scope in advisory_scopes(vulns, ref.get("package", ""), eco):
+            if not scope.scoped or not scope.covers(parsed):
+                continue
+            ids = {str(scope.advisory_id).upper()}
+            ids.update(str(a).upper() for a in (scope.aliases or []))
+            still_open.extend(sorted(wanted & ids))
+        return sorted(set(still_open))
 
     def _is_vulnerable(self, ref: dict, version: str) -> bool:
         """Is this version covered by a known advisory? Cache-backed.

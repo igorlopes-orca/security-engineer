@@ -1,6 +1,6 @@
 ---
 description: Run the security engineer with explicit flags, taken exactly as typed — no interpretation
-argument-hint: "[risk_levels,feature_types] [--scan] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
+argument-hint: "[risk_levels,feature_types] [--scan] [--cve <id>] [--alert <id>] [--max N] [--dry-run] | --remote <owner/repo|all> [filters]"
 allowed-tools: Bash
 ---
 
